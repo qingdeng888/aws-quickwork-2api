@@ -185,6 +185,11 @@ func (m *Manager) RefreshAll(ctx context.Context) ([]RefreshResult, error) {
 			return results, err
 		}
 		a := &list[i]
+		// A disabled account is parked: refreshing it would only rotate tokens
+		// the operator deliberately took out of rotation.
+		if a.Disabled {
+			continue
+		}
 		if strings.TrimSpace(a.RefreshToken) == "" {
 			results = append(results, RefreshResult{Account: a, Err: oauth.ErrNoRefreshToken})
 			_ = m.store.SetError(ctx, a.ID, oauth.ErrNoRefreshToken.Error())

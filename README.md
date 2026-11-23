@@ -25,7 +25,7 @@
 - `system` / `developer` 消息与工具定义放在本轮 user 文本开头的 `[System instructions from the API caller]` 区块内；上游会忽略每轮 `system_prompt` 字段，并把 `custom_prompt` 当作低信任的个人偏好，user 轮次是唯一可靠送达调用方指令的通道
 - 64 KB 单帧预算按实际 JSON 字节计算：用户内容过大时优先走 out-of-band 附件（`upload-attachment` → DLP 扫描 → `files/upload`），WebSocket 只发送短引用与 `attachments` 元数据；附件只包含用户内容，调用方指令仍留在 WS 文本里。附件不可用时才裁剪、保留开头与结尾，避免直接返回 `request_too_large`
 - `chat_agent_id` 可指定一个 QuickWork 自定义 agent，以替代默认内置 agent 的提示词与工具策略
-- `/admin` 密码保护的管理前端，与 `/v1` 共用端口和进程：账号列表 / 刷新 / 删除、网页内完成 OAuth 登录（手动回填或本机回调）、配置编辑、请求日志与 Playground
+- `/admin` 密码保护的管理前端，与 `/v1` 共用端口和进程：账号列表 / 刷新 / 停用 / 删除、账号导出与增量导入、网页内完成 OAuth 登录（手动回填或本机回调）、配置编辑、请求日志与 Playground
 - 一条 `docker compose up -d` 即可部署：镜像由 GitHub Actions 构建并推送到 GHCR，`.env` 定义端口、管理密码与 API key
 
 ## 环境要求
@@ -215,6 +215,9 @@ for chunk in client.chat.completions.create(
 | `quickproxy accounts` | 列出账号、到期时间、使用次数与最近错误 |
 | `quickproxy refresh` | 刷新全部账号的 token |
 | `quickproxy refresh -account ID` | 只刷新一个账号 |
+| `quickproxy export -out accounts.json` | 导出全部账号（默认含 token；`-secrets=false` 只导元数据） |
+| `quickproxy import -in accounts.json` | 增量导入：只新增不存在的账号，已存在的跳过 |
+| `quickproxy import -in accounts.json -update` | 增量导入并更新已存在账号的 token |
 | `quickproxy logout -all` | 删除全部账号 |
 | `quickproxy logout -account ID` | 删除一个账号 |
 | `quickproxy passwd` | 设置管理密码，写入 `webui.password_hash` 并清空明文 |
@@ -283,7 +286,7 @@ for chunk in client.chat.completions.create(
 - 管理端点带 `Content-Security-Policy: default-src 'self'`、`X-Frame-Options: DENY`、`X-Content-Type-Options: nosniff`，且不返回 CORS 头，避免被第三方页面驱动。
 - `webui.trust_proxy` 默认关闭。挂在反向代理后面又需要按真实客户端 IP 限速时，才打开它并确保代理会覆盖 `X-Forwarded-For`。
 
-管理 API（全部在 `/admin/api` 下）：`POST /auth/login`、`GET /auth/session`、`POST /auth/logout`、`GET /overview`、`GET /endpoints`、`GET /accounts`、`POST /accounts/refresh`、`DELETE /accounts/{id}`、`POST /accounts/login`、`GET /accounts/login/{id}`、`POST /accounts/login/{id}/callback`、`DELETE /accounts/login/{id}`、`GET /config`、`PUT /config`、`GET /logs`、`POST /playground`。
+管理 API（全部在 `/admin/api` 下）：`POST /auth/login`、`GET /auth/session`、`POST /auth/logout`、`GET /overview`、`GET /endpoints`、`GET /accounts`、`POST /accounts/refresh`、`POST /accounts/{id}/disable`、`POST /accounts/{id}/enable`、`GET /accounts/export`、`POST /accounts/import`、`DELETE /accounts/{id}`、`POST /accounts/login`、`GET /accounts/login/{id}`、`POST /accounts/login/{id}/callback`、`DELETE /accounts/login/{id}`、`GET /config`、`PUT /config`、`GET /logs`、`POST /playground`。
 
 ## Docker 部署
 
@@ -322,7 +325,9 @@ docker compose up -d
 
 除请求触发的刷新外，服务还会在后台做定期检查：每 `refresh_before / 2`（上限 1 分钟、下限 15 秒）扫一遍账号，把进入刷新窗口的账号提前换掉 token，因此**即使没有流量、甚至只打开管理页面看倒计时，账号也会在到期前自动刷新**。刷新失败的账号会记录 `last_error` 并在 15 分钟后重试；同一账号同一时刻只会有一个刷新在跑（请求与后台共用账号锁）。
 
-`quickproxy accounts` 可查看每个账号的状态；`quickproxy refresh` 会刷新全部账号。上游 refresh token 失效时，对应账号需要重新执行 `quickproxy login`。
+`quickproxy accounts` 可查看每个账号的状态；`quickproxy refresh` 会刷新全部账号，停用的账号会被跳过（既不参与轮询，也不参与自动刷新）。上游 refresh token 失效时，对应账号需要重新执行 `quickproxy login`。
+
+需要备份或迁移时，用 `quickproxy export -out accounts.json` 导出全部账号，再在目标机器 `quickproxy import -in accounts.json` 增量导入：同 `email + tenant` 的账号默认跳过，加 `-update` 才会覆盖它的 token；已停用的账号导入后仍是停用状态。`/admin` 账号页也提供「导出账号 / 导入账号」按钮，走同一份 JSON 格式。
 
 ## 工作方式
 

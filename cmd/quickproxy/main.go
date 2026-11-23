@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -41,6 +43,10 @@ func run(args []string) int {
 		return listAccounts(args[1:])
 	case "refresh":
 		return refreshAccounts(args[1:])
+	case "export":
+		return exportAccounts(args[1:])
+	case "import":
+		return importAccounts(args[1:])
 	case "logout":
 		return logout(args[1:])
 	case "passwd":
@@ -70,6 +76,8 @@ Usage:
                       [-timeout 1h] [-open] [-manual]
   quickproxy accounts [-config config.json]
   quickproxy refresh  [-config config.json] [-account ID]
+  quickproxy export   [-config config.json] [-out FILE] [-secrets=false]
+  quickproxy import   [-config config.json] -in FILE [-update]
   quickproxy logout   [-config config.json] (-all | -account ID)
   quickproxy passwd   [-config config.json] [-password PW]
   quickproxy config   [-config config.json] [-from-env=false]
@@ -234,6 +242,101 @@ func login(args []string) int {
 		return 1
 	}
 	fmt.Printf("account %d ready: %s (%s, %s)\n", acct.ID, displayAccount(acct), acct.Provider, acct.WSHost)
+	return 0
+}
+
+func exportAccounts(args []string) int {
+	fs := flag.NewFlagSet("export", flag.ExitOnError)
+	configPath := fs.String("config", "config.json", "path to config.json")
+	out := fs.String("out", "", "write the JSON document to this file instead of stdout")
+	secrets := fs.Bool("secrets", true, "include tokens and client secrets so the file can restore a working install")
+	_ = fs.Parse(args)
+
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "config:", err)
+		return 1
+	}
+	st, err := openStore(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer st.Close()
+
+	result, err := accounts.Export(context.Background(), st, *secrets)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "export accounts:", err)
+		return 1
+	}
+	body, err := json.MarshalIndent(result.File, "", "  ")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "encode export:", err)
+		return 1
+	}
+	body = append(body, '\n')
+	if *out == "" {
+		if _, err := os.Stdout.Write(body); err != nil {
+			fmt.Fprintln(os.Stderr, "write export:", err)
+			return 1
+		}
+	} else if err := os.WriteFile(*out, body, 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, "write export:", err)
+		return 1
+	}
+	fmt.Fprintf(os.Stderr, "exported %d accounts (disabled=%d secrets=%v)\n",
+		result.AccountCount, result.DisabledCount, *secrets)
+	return 0
+}
+
+func importAccounts(args []string) int {
+	fs := flag.NewFlagSet("import", flag.ExitOnError)
+	configPath := fs.String("config", "config.json", "path to config.json")
+	in := fs.String("in", "-", "exported JSON document to import (default: stdin)")
+	update := fs.Bool("update", false, "also update tokens of accounts that already exist")
+	_ = fs.Parse(args)
+
+	var body []byte
+	var err error
+	if *in == "-" || *in == "" {
+		body, err = io.ReadAll(os.Stdin)
+	} else {
+		body, err = os.ReadFile(*in)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "read import:", err)
+		return 1
+	}
+	var file accounts.TransferFile
+	if err := json.Unmarshal(body, &file); err != nil {
+		fmt.Fprintln(os.Stderr, "parse import (expected the document `quickproxy export` writes):", err)
+		return 1
+	}
+
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "config:", err)
+		return 1
+	}
+	st, err := openStore(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer st.Close()
+
+	result, err := accounts.Import(context.Background(), st, &file, *update)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "import accounts:", err)
+		return 1
+	}
+	fmt.Printf("imported %d, updated %d, skipped %d\n", result.Imported, result.Updated, result.Skipped)
+	for _, item := range result.Errors {
+		fmt.Fprintln(os.Stderr, "  skipped:", item)
+	}
+	if len(result.Errors) > 0 {
+		return 1
+	}
 	return 0
 }
 

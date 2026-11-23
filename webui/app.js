@@ -406,6 +406,8 @@ function statusBadge(status) {
 function renderAccounts() {
   setTopActions([
     { label: '刷新全部', onClick: (button) => refreshAllAccounts(button) },
+    { label: '导出账号', onClick: () => exportAccounts() },
+    { label: '导入账号', onClick: () => importAccounts() },
     { label: '新增账号', cls: 'primary', onClick: () => navigate('login') },
   ]);
 
@@ -424,6 +426,7 @@ function renderAccounts() {
       <td class="cell-sub truncate" title="${esc(account.last_error)}">${esc(account.last_error || '—')}</td>
       <td class="actions">
         <button class="btn ghost sm" type="button" data-action="refresh" data-id="${account.id}">刷新</button>
+        <button class="btn ghost sm" type="button" data-action="toggle" data-id="${account.id}" data-disabled="${account.status === 'disabled' ? '1' : '0'}">${account.status === 'disabled' ? '启用' : '停用'}</button>
         <button class="btn danger sm" type="button" data-action="delete" data-id="${account.id}" data-label="${esc(account.label)}">删除</button>
       </td>
     </tr>`;
@@ -448,6 +451,8 @@ function renderAccounts() {
       const id = Number(button.dataset.id);
       if (button.dataset.action === 'refresh') {
         await refreshAccount(id, button);
+      } else if (button.dataset.action === 'toggle') {
+        await toggleAccount(id, button.dataset.disabled === '1', button);
       } else {
         const label = button.dataset.label;
         const ok = await confirmDialog('删除账号', `确认删除「${label}」（id ${id}）？该账号的 token 会从本地 SQLite 移除。`, '删除');
@@ -462,6 +467,85 @@ function renderAccounts() {
       }
     });
   });
+}
+
+async function toggleAccount(id, enable, button) {
+  const original = button.textContent;
+  button.disabled = true;
+  try {
+    await api(`/accounts/${id}/${enable ? 'enable' : 'disable'}`, { method: 'POST', body: {} });
+    toast(enable ? '账号已启用，重新加入轮询' : '账号已停用，不再参与轮询和自动刷新');
+    await pageAccounts();
+  } catch (error) {
+    toast(error.message, 'err');
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+async function exportAccounts() {
+  try {
+    const response = await fetch('/admin/api/accounts/export', { credentials: 'same-origin' });
+    if (response.status === 401) {
+      showLogin('登录已过期，请重新登录');
+      return;
+    }
+    if (!response.ok) {
+      const detail = await response.json().catch(() => null);
+      throw new Error((detail && detail.error && detail.error.message) || `HTTP ${response.status}`);
+    }
+    const blob = await response.blob();
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '');
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `quickwork-accounts-${stamp}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    toast('已导出全部账号（含 token，请妥善保管）');
+  } catch (error) {
+    toast(error.message, 'err');
+  }
+}
+
+function importAccounts() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'application/json,.json';
+  input.addEventListener('change', async () => {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      let doc;
+      try {
+        doc = JSON.parse(text);
+      } catch (error) {
+        throw new Error('不是有效的 JSON 文件');
+      }
+      const list = Array.isArray(doc) ? doc : doc && doc.accounts;
+      if (!Array.isArray(list) || list.length === 0) throw new Error('文件里没有 accounts 数组');
+      const ok = await confirmDialog(
+        '增量导入账号',
+        `将要导入 ${list.length} 个账号。已存在（同 email + tenant）的账号会跳过，不会覆盖本地 token；新增的会立即加入轮询。`,
+        '导入',
+      );
+      if (!ok) return;
+      const result = await api('/accounts/import', {
+        method: 'POST',
+        body: { version: (doc && doc.version) || 1, accounts: list },
+      });
+      const failures = (result.errors || []).length;
+      toast(`导入完成：新增 ${result.imported}，跳过 ${result.skipped}，失败 ${failures}`, failures ? 'err' : 'ok');
+      if (failures) console.warn('import errors', result.errors);
+      await pageAccounts();
+    } catch (error) {
+      toast(error.message, 'err');
+    }
+  });
+  input.click();
 }
 
 async function refreshAccount(id, button) {
