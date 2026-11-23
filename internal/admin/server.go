@@ -240,6 +240,17 @@ func loadAssets() {
 	assetTag = hex.EncodeToString(sum.Sum(nil)[:4])
 }
 
+// versionedIndex appends the embedded-asset digest to app.js and styles.css so
+// the HTML and the scripts it loads always come from the same build.
+func versionedIndex(body []byte, tag string) []byte {
+	if tag == "" {
+		return body
+	}
+	out := strings.ReplaceAll(string(body), `href="/admin/styles.css"`, `href="/admin/styles.css?v=`+tag+`"`)
+	out = strings.ReplaceAll(out, `src="/admin/app.js"`, `src="/admin/app.js?v=`+tag+`"`)
+	return []byte(out)
+}
+
 // serveAsset serves the embedded single-page interface. Only the three known
 // files are reachable; everything else falls back to index.html so the UI can
 // own its in-page routing.
@@ -262,12 +273,19 @@ func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", file.contentType)
-	w.Header().Set("ETag", file.etag)
 	if name == "index.html" {
+		// Stamp the asset URLs with a digest of the embedded files so an
+		// upgraded binary can never hand the browser a new index.html paired
+		// with a cached old app.js (that mismatch broke navigation).
+		body := versionedIndex(file.body, assetTag)
 		w.Header().Set("Cache-Control", "no-cache")
-	} else {
-		w.Header().Set("Cache-Control", "public, max-age=300")
+		http.ServeContent(w, r, name, s.startedAt, bytes.NewReader(body))
+		return
 	}
+	w.Header().Set("ETag", file.etag)
+	// The query string from index.html keys the cache, so a stale copy is
+	// never reused across upgrades.
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	if match := r.Header.Get("If-None-Match"); match != "" && strings.Contains(match, file.etag) {
 		w.WriteHeader(http.StatusNotModified)
 		return
