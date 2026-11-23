@@ -458,6 +458,11 @@ func (s *Server) serveChat(w http.ResponseWriter, r *http.Request, flavor wireFl
 			finish = "tool_calls"
 		}
 		s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "ok", finish, res.Usage, len(toolCalls), nil)
+		// Expose the upstream thread so a client can continue the conversation
+		// even without streaming (streaming already sets it in sendHeaders).
+		if res.ThreadID != "" {
+			w.Header().Set("X-Thread-Id", res.ThreadID)
+		}
 		writeFlavorCompletion(w, flavor, id, created, outModel, text, toolCalls, finish, res.Usage)
 		return
 	}
