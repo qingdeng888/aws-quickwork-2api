@@ -31,6 +31,11 @@ const (
 	maxSessions    = 256
 	loginWindow    = 5 * time.Minute
 	maxLoginChecks = 4
+	// maxLoginChecksPerIP stops one client from holding every global slot.
+	maxLoginChecksPerIP = 2
+	// loginCheckWait is how long a request waits for a free global slot
+	// before it is answered with 429.
+	loginCheckWait = 2 * time.Second
 )
 
 // handleLogin verifies the management password, opens a session, and returns
@@ -44,11 +49,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	if !s.reserveLoginCheck(client) {
+	if !s.acquireLoginCheck(r.Context(), client) {
 		writeError(w, http.StatusTooManyRequests, "rate_limited", "too many login attempts; wait a few minutes and retry")
 		return
 	}
-	defer s.releaseLoginCheck()
+	defer s.releaseLoginCheck(client)
 
 	credential := s.webui()
 	if !credential.Check(input.Password) {
@@ -88,7 +93,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Path:     "/admin",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		Secure:   requestIsSecure(r),
+		Secure:   requestIsSecure(r, s.webui().TrustProxy),
 		Expires:  expires,
 		MaxAge:   int(ttl.Seconds()),
 	})
@@ -129,7 +134,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		Path:     "/admin",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		Secure:   requestIsSecure(r),
+		Secure:   requestIsSecure(r, s.webui().TrustProxy),
 		MaxAge:   -1,
 	})
 	w.WriteHeader(http.StatusNoContent)
@@ -158,7 +163,7 @@ func (s *Server) csrf(next http.HandlerFunc) http.HandlerFunc {
 			writeError(w, http.StatusForbidden, "csrf_failed", "missing or invalid CSRF token")
 			return
 		}
-		if origin := r.Header.Get("Origin"); origin != "" && !originAllowed(r, origin) {
+		if origin := r.Header.Get("Origin"); origin != "" && !originAllowed(r, origin, s.webui().TrustProxy) {
 			writeError(w, http.StatusForbidden, "origin_failed", "request origin does not match this server")
 			return
 		}
@@ -196,10 +201,44 @@ func (s *Server) sessionFromRequest(r *http.Request) (*session, bool) {
 // reserveLoginCheck counts an attempt before verification so parallel guesses
 // cannot all pass the same failure count, and caps how many expensive password
 // hashes run at once.
+//
+// The global cap is a semaphore: a request waits up to loginCheckWait for a
+// slot (or until its context ends) before giving up. The per-IP cap and the
+// attempt window are checked without waiting.
+func (s *Server) acquireLoginCheck(ctx context.Context, client string) bool {
+	sem := s.loginSemaphore()
+	timer := time.NewTimer(loginCheckWait)
+	defer timer.Stop()
+	select {
+	case sem <- struct{}{}:
+	case <-timer.C:
+		return false
+	case <-ctx.Done():
+		return false
+	}
+	if !s.reserveLoginCheck(client) {
+		<-sem
+		return false
+	}
+	return true
+}
+
+func (s *Server) loginSemaphore() chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loginSem == nil {
+		s.loginSem = make(chan struct{}, maxLoginChecks)
+	}
+	return s.loginSem
+}
+
 func (s *Server) reserveLoginCheck(client string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.loginChecks >= maxLoginChecks {
+	if s.loginChecksByIP == nil {
+		s.loginChecksByIP = make(map[string]int)
+	}
+	if s.loginChecksByIP[client] >= maxLoginChecksPerIP {
 		return false
 	}
 	now := time.Now()
@@ -227,15 +266,28 @@ func (s *Server) reserveLoginCheck(client string) bool {
 	}
 	window.count++
 	s.loginChecks++
+	s.loginChecksByIP[client]++
 	return true
 }
 
-func (s *Server) releaseLoginCheck() {
+func (s *Server) releaseLoginCheck(client string) {
 	s.mu.Lock()
 	if s.loginChecks > 0 {
 		s.loginChecks--
 	}
+	if n := s.loginChecksByIP[client]; n > 1 {
+		s.loginChecksByIP[client] = n - 1
+	} else {
+		delete(s.loginChecksByIP, client)
+	}
+	sem := s.loginSem
 	s.mu.Unlock()
+	if sem != nil {
+		select {
+		case <-sem:
+		default:
+		}
+	}
 }
 
 func (s *Server) evictOldestWindowLocked() {

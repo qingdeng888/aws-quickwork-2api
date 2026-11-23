@@ -146,12 +146,25 @@ func (m *Manager) RefreshOne(ctx context.Context, id int64) (*store.Account, err
 	if a, err = m.store.Get(ctx, id); err != nil {
 		return nil, err
 	}
+	// A refresh that just succeeded (e.g. a double click or a concurrent
+	// request) does not need to be repeated.
+	if recentlyRefreshed(a, time.Now()) {
+		return a, nil
+	}
 	refreshed, err := m.refreshLocked(ctx, a)
 	if err != nil {
 		_ = m.store.SetError(ctx, id, err.Error())
 		return nil, err
 	}
 	return refreshed, nil
+}
+
+// recentRefreshWindow is how long a successful refresh suppresses RefreshOne.
+const recentRefreshWindow = 30 * time.Second
+
+func recentlyRefreshed(a *store.Account, now time.Time) bool {
+	return a != nil && a.ObtainedAt > 0 && a.LastError == "" && a.JWT() != "" &&
+		now.Sub(time.Unix(a.ObtainedAt, 0)) < recentRefreshWindow
 }
 
 // RefreshResult is one account's outcome from RefreshAll.

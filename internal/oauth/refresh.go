@@ -89,8 +89,13 @@ func Refresh(ctx context.Context, a *store.Account) (*store.Account, error) {
 			AccountName:  out.AccountName,
 		}
 	}
+	previousInfo := out.UserInfo
 	if err := applySession(&out, t, info); err != nil {
 		return nil, err
+	}
+	if infoErr != nil && previousInfo != "" {
+		// Keep the full stored profile rather than the partial fallback.
+		out.UserInfo = previousInfo
 	}
 	return &out, nil
 }

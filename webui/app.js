@@ -1063,7 +1063,7 @@ function renderChatLog() {
   host.innerHTML = state.chat.messages.map((message) => {
     const meta = message.meta ? `<div class="meta">${esc(message.meta)}</div>` : '';
     return `<div class="msg ${esc(message.role)}${message.error ? ' error' : ''}">
-      <div class="role">${message.role}</div>
+      <div class="role">${esc(message.role)}</div>
       <div class="body">${esc(message.content || (message.pending ? '…' : ''))}</div>
       ${meta}
     </div>`;

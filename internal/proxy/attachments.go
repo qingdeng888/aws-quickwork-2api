@@ -301,7 +301,7 @@ func readLimited(r io.Reader, limit int64) ([]byte, error) {
 func snippet(body []byte) string {
 	s := strings.TrimSpace(string(body))
 	if len(s) > 200 {
-		s = s[:200] + "…"
+		s = utf8Prefix(s, 200) + "…"
 	}
 	return s
 }

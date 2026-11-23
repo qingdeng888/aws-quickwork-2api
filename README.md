@@ -306,7 +306,7 @@ docker compose up -d
 | `.github/workflows/docker.yml` | push `main` / 打 `v*` tag 构建 amd64+arm64 推到 GHCR，并对 amd64 镜像做冒烟测试 |
 
 - 所有持久化数据都在 `./data`：`config.json` + `quickwork.db`。入口脚本会以 root 修正该目录属主后立刻降权到 uid 10001，正常部署不需要手动 `chown`；只有显式配置了 `user:` 时才需要预先授权。
-- `.env` 的变量每次启动都会合并进 `config.json`（空值不覆盖）；`CONFIG_FROM_ENV=false` 可关闭。密码想以 `/admin` 修改为准，就把 `WEBUI_PASSWORD` 留空或改用 `WEBUI_PASSWORD_HASH`。
+- `.env` 的变量每次启动都会合并进 `config.json`（空值不覆盖）；`CONFIG_FROM_ENV=false` 可关闭。`WEBUI_PASSWORD` 只以 PBKDF2 哈希写盘，文件里已有 `password_hash` 时默认不覆盖，`WEBUI_PASSWORD_FORCE=1` 可强制以 env 为准。
 - 宿主机浏览器无法回调容器里的 `127.0.0.1:18080`，容器内请在 `/admin` → 登录上游 用「手动回填 callback URL」，或执行 `docker compose run --rm -it quickproxy login -manual`。
 - 环境变量与配置字段的完整对照见 [DEPLOY.md](DEPLOY.md#6-常驻运行)。
 

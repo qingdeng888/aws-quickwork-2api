@@ -28,6 +28,10 @@ const (
 // upstream 64 KB per-frame limit even after trimming older prompt text.
 var ErrUserMessageTooLarge = errors.New("user_message exceeds the upstream 64 KB frame limit")
 
+// errTruncated means the upstream stream ended after partial output but before
+// any completion or terminal event, so the answer may be incomplete.
+var errTruncated = errors.New("upstream stream ended before the turn completed")
+
 type Upstream struct {
 	cfg *config.Config
 }
@@ -169,16 +173,43 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 			}
 		}
 	}()
+	// session_delete must be attempted even when ctx is cancelled, before the
+	// connection is closed, or the upstream session is orphaned.
+	var deleteOnce sync.Once
+	sendDelete := func() {
+		deleteOnce.Do(func() {
+			if !in.DeleteSession {
+				return
+			}
+			frame, err := encode(map[string]any{"type": "session_delete", "payload": map[string]any{"session_id": threadID}})
+			if err == nil {
+				writeMu.Lock()
+				_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+				err = conn.WriteMessage(messageType, frame)
+				writeMu.Unlock()
+			}
+			if err != nil {
+				log.Printf("session_delete thread=%s failed: %v", threadID, err)
+			}
+		})
+	}
+	connDone := make(chan struct{})
+	defer close(connDone)
 	go func() {
-		<-ctx.Done()
-		_ = conn.Close()
+		select {
+		case <-ctx.Done():
+			sendDelete()
+			_ = conn.Close()
+		case <-connDone:
+		}
 	}()
 
 	// Handshake. The AIDP and Gateway paths use different session_connect shapes.
+	var connectErr error
 	if gateway {
-		_ = send(map[string]any{"type": "session_connect", "session_id": sess.OutpostID})
+		connectErr = send(map[string]any{"type": "session_connect", "session_id": sess.OutpostID})
 	} else {
-		_ = send(map[string]any{
+		connectErr = send(map[string]any{
 			"type": "session_connect",
 			"payload": map[string]any{
 				"actor_id":               sess.ActorARN,
@@ -190,12 +221,19 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 			},
 		})
 	}
-	_ = send(map[string]any{"type": "federate_status", "payload": map[string]any{}})
+	if connectErr != nil {
+		return ChatResult{}, fmt.Errorf("send session_connect: %w", connectErr)
+	}
+	if err := send(map[string]any{"type": "federate_status", "payload": map[string]any{}}); err != nil {
+		return ChatResult{}, fmt.Errorf("send federate_status: %w", err)
+	}
 	if in.CreateSession {
-		_ = send(map[string]any{
+		if err := send(map[string]any{
 			"type":    "session_create",
 			"payload": map[string]any{"session_id": threadID, "title": title},
-		})
+		}); err != nil {
+			return ChatResult{}, fmt.Errorf("send session_create: %w", err)
+		}
 	}
 
 	payload := map[string]any{
@@ -271,9 +309,7 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 
 	result, err := u.readEvents(ctx, conn, gateway, threadID, onEvent)
 	result.ThreadID = threadID
-	if in.DeleteSession {
-		_ = send(map[string]any{"type": "session_delete", "payload": map[string]any{"session_id": threadID}})
-	}
+	sendDelete()
 	if err != nil {
 		return result, err
 	}
@@ -468,8 +504,13 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 				if emitErr != nil {
 					return res, emitErr
 				}
-				if text.Len() > 0 || len(toolOrder) > 0 {
+				// Partial output only counts as success once the turn reached
+				// a completion event; otherwise the answer may be cut short.
+				if sawMessageComplete && (text.Len() > 0 || len(toolOrder) > 0) {
 					return res, nil
+				}
+				if text.Len() > 0 || len(toolOrder) > 0 {
+					return res, fmt.Errorf("%w: upstream WebSocket read: %v", errTruncated, err)
 				}
 				return res, fmt.Errorf("upstream WebSocket read: %w", err)
 			}
@@ -782,7 +823,21 @@ func truncateText(s string, max int) string {
 	if max <= 0 || len(s) <= max {
 		return s
 	}
-	return s[:max] + "…"
+	return utf8Prefix(s, max) + "…"
+}
+
+// utf8Prefix returns at most max bytes of s without splitting a rune.
+func utf8Prefix(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
 }
 
 // fitUserMessage keeps the user_message payload under the upstream limit.
@@ -889,7 +944,7 @@ func shrinkMiddle(s string, remove int, marker string) string {
 func titleFor(prompt string) string {
 	clean := strings.Join(strings.Fields(prompt), " ")
 	if len(clean) > 60 {
-		clean = clean[:60] + "…"
+		clean = utf8Prefix(clean, 60) + "…"
 	}
 	if clean == "" {
 		clean = "New Conversation"

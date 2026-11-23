@@ -26,6 +26,9 @@ type upstreamLogin struct {
 	startedAt time.Time
 	cancel    context.CancelFunc
 	feed      io.WriteCloser
+	// feedReader is closed with an error when the flow ends or is cancelled,
+	// so a writer blocked on the synchronous pipe returns instead of leaking.
+	feedReader *io.PipeReader
 
 	mu           sync.Mutex
 	text         strings.Builder
@@ -88,6 +91,9 @@ func (l *upstreamLogin) finish(account *store.Account, err error) {
 
 func (l *upstreamLogin) cancelLogin() {
 	l.cancel()
+	if l.feedReader != nil {
+		_ = l.feedReader.CloseWithError(errors.New("login cancelled"))
+	}
 	l.mu.Lock()
 	if l.status == "running" {
 		l.status = "cancelled"
@@ -239,9 +245,15 @@ func (s *Server) handleStartLogin(w http.ResponseWriter, r *http.Request) {
 	if mode == "manual" {
 		reader, writer := io.Pipe()
 		login.feed = writer
+		login.feedReader = reader
 		go func() {
 			defer writer.Close()
 			account, err := oauth.LoginManual(ctx, opts, s.store, reader, login)
+			closeErr := err
+			if closeErr == nil {
+				closeErr = errors.New("login finished")
+			}
+			_ = reader.CloseWithError(closeErr)
 			login.finish(account, err)
 			if err != nil {
 				s.logger.Printf("manual login %s ended: %v", id, err)
@@ -309,10 +321,17 @@ func (s *Server) handleLoginCallback(w http.ResponseWriter, r *http.Request) {
 				_, err := io.WriteString(feed, target+"\n")
 				written <- err
 			}()
+			// The request returns immediately, so its context is not a useful
+			// bound here; use our own timer. The writer goroutine itself always
+			// ends because the reader is closed when the flow finishes.
+			timer := time.NewTimer(20 * time.Second)
+			defer timer.Stop()
 			select {
 			case <-written:
-			case <-time.After(20 * time.Second):
-			case <-r.Context().Done():
+			case <-timer.C:
+				if login.feedReader != nil {
+					_ = login.feedReader.CloseWithError(errors.New("callback write timed out"))
+				}
 			}
 		}()
 	}

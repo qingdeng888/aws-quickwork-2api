@@ -1,11 +1,15 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// errSkip lets a setter decline a set variable without reporting it applied.
+var errSkip = errors.New("skipped")
 
 // LookupEnv matches os.LookupEnv, which keeps "set but empty" distinguishable
 // from "not set".
@@ -35,6 +39,9 @@ func ApplyEnv(cfg *Config, lookup LookupEnv) ([]string, error) {
 			return nil
 		}
 		if err := setter(value); err != nil {
+			if errors.Is(err, errSkip) {
+				return nil
+			}
 			return fmt.Errorf("%s: %w", name, err)
 		}
 		applied = append(applied, name)
@@ -132,17 +139,41 @@ func ApplyEnv(cfg *Config, lookup LookupEnv) ([]string, error) {
 		defaults := Default()
 		cfg.WebUI = defaults.WebUI
 	}
+	// A credential already stored as a hash was either rendered earlier or
+	// changed by the admin in the web UI. Env must not silently roll it back
+	// unless WEBUI_PASSWORD_FORCE is set.
+	force := false
+	if raw, ok := lookup("WEBUI_PASSWORD_FORCE"); ok && strings.TrimSpace(raw) != "" {
+		parsed, err := parseBool(strings.TrimSpace(raw))
+		if err != nil {
+			return applied, fmt.Errorf("WEBUI_PASSWORD_FORCE: %w", err)
+		}
+		force = parsed
+	}
+	keepHash := !force && strings.TrimSpace(cfg.WebUI.PasswordHash) != ""
+
 	webui := []override{
 		{"WEBUI_ENABLED", boolean(&cfg.WebUI.Enabled)},
 		{"WEBUI_SESSION_TTL", duration(&cfg.WebUI.SessionTTL)},
 		{"WEBUI_MAX_ATTEMPTS", number(&cfg.WebUI.MaxAttempts)},
 		{"WEBUI_TRUST_PROXY", boolean(&cfg.WebUI.TrustProxy)},
 		{"WEBUI_PASSWORD", func(value string) error {
-			cfg.WebUI.Password = value
-			cfg.WebUI.PasswordHash = ""
+			if keepHash {
+				return errSkip
+			}
+			// Store only the hash; plaintext never reaches config.json.
+			hash, err := HashPassword(value)
+			if err != nil {
+				return err
+			}
+			cfg.WebUI.PasswordHash = hash
+			cfg.WebUI.Password = ""
 			return nil
 		}},
 		{"WEBUI_PASSWORD_HASH", func(value string) error {
+			if keepHash {
+				return errSkip
+			}
 			if !ValidPasswordHash(value) {
 				return fmt.Errorf("not a pbkdf2-sha256 hash; generate one with `quickproxy passwd -password ...`")
 			}

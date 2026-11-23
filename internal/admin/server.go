@@ -49,6 +49,10 @@ type Server struct {
 	sessions    map[string]*session
 	attempts    map[string]*attemptWindow
 	loginChecks int
+	// loginChecksByIP counts in-flight password checks per client.
+	loginChecksByIP map[string]int
+	// loginSem bounds concurrent password checks globally.
+	loginSem chan struct{}
 
 	loginsMu sync.Mutex
 	logins   map[string]*upstreamLogin
@@ -155,11 +159,18 @@ func (s *Server) webui() config.WebUI {
 // webui.trust_proxy is on, because the header is client-controlled.
 func (s *Server) clientIP(r *http.Request) string {
 	if s.webui().TrustProxy {
+		// The trusted proxy appends the peer it saw, so the rightmost entry
+		// is the only one not under client control.
 		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-			if first, _, found := strings.Cut(forwarded, ","); found {
-				return strings.TrimSpace(first)
+			parts := strings.Split(forwarded, ",")
+			for i := len(parts) - 1; i >= 0; i-- {
+				if ip := strings.TrimSpace(parts[i]); ip != "" {
+					return ip
+				}
 			}
-			return strings.TrimSpace(forwarded)
+		}
+		if real := strings.TrimSpace(r.Header.Get("X-Real-IP")); real != "" {
+			return real
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -169,14 +180,15 @@ func (s *Server) clientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-func requestIsSecure(r *http.Request) bool {
+func requestIsSecure(r *http.Request, trustProxy bool) bool {
 	if r == nil {
 		return false
 	}
 	if r.TLS != nil {
 		return true
 	}
-	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+	// X-Forwarded-Proto is client-controlled unless a trusted proxy sets it.
+	return trustProxy && strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
 }
 
 // ---- assets -------------------------------------------------------------
@@ -323,7 +335,7 @@ func humanDuration(d config.Duration) string {
 	return text
 }
 
-func originAllowed(r *http.Request, origin string) bool {
+func originAllowed(r *http.Request, origin string, trustProxy bool) bool {
 	parsed, err := url.Parse(origin)
 	if err != nil || parsed.Host == "" {
 		return false
@@ -332,7 +344,7 @@ func originAllowed(r *http.Request, origin string) bool {
 		return false
 	}
 	scheme := "http"
-	if requestIsSecure(r) {
+	if requestIsSecure(r, trustProxy) {
 		scheme = "https"
 	}
 	return strings.EqualFold(parsed.Scheme, scheme)

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
@@ -14,7 +15,12 @@ import (
 // conversation keeps the upstream thread used for one client conversation and
 // the client messages already forwarded to it.
 type conversation struct {
-	mu           sync.Mutex
+	// sem is a one-slot semaphore so waiting for the conversation can be
+	// abandoned when the request context ends.
+	sem chan struct{}
+	// refs counts requests holding or waiting on this entry; guarded by the
+	// store mutex. Entries with refs > 0 are never evicted.
+	refs         int
 	threadID     string
 	accountID    int64
 	messages     []Message
@@ -80,10 +86,10 @@ func newConversationStore(ttl time.Duration, max int) *conversationStore {
 // least-recently-used conversations are dropped first. The store lock is
 // released before waiting on a conversation so one busy chat cannot stall
 // unrelated conversations.
-func (s *conversationStore) acquire(key string) *conversation {
+func (s *conversationStore) acquire(ctx context.Context, key string) (*conversation, error) {
 	s.mu.Lock()
 	for k, c := range s.entries {
-		if c.idle() > s.ttl {
+		if c.refs == 0 && c.idle() > s.ttl {
 			delete(s.entries, k)
 		}
 	}
@@ -91,6 +97,9 @@ func (s *conversationStore) acquire(key string) *conversation {
 		var oldestKey string
 		var oldest time.Time
 		for k, c := range s.entries {
+			if c.refs > 0 {
+				continue
+			}
 			used := time.Unix(0, c.lastUsed.Load())
 			if oldestKey == "" || used.Before(oldest) {
 				oldestKey, oldest = k, used
@@ -102,19 +111,30 @@ func (s *conversationStore) acquire(key string) *conversation {
 	}
 	c := s.entries[key]
 	if c == nil {
-		c = &conversation{}
+		c = &conversation{sem: make(chan struct{}, 1)}
 		s.entries[key] = c
 	}
+	c.refs++
 	s.mu.Unlock()
 
-	c.mu.Lock()
-	c.touch()
-	return c
+	select {
+	case c.sem <- struct{}{}:
+		c.touch()
+		return c, nil
+	case <-ctx.Done():
+		s.mu.Lock()
+		c.refs--
+		s.mu.Unlock()
+		return nil, ctx.Err()
+	}
 }
 
 func (s *conversationStore) release(c *conversation) {
 	c.touch()
-	c.mu.Unlock()
+	<-c.sem
+	s.mu.Lock()
+	c.refs--
+	s.mu.Unlock()
 }
 
 // conversationKey identifies one OpenAI conversation. A client-provided
@@ -124,7 +144,10 @@ func (s *conversationStore) release(c *conversation) {
 func conversationKey(r *http.Request, req *ChatRequest, fullSystemPrompt string) string {
 	for _, header := range []string{"X-Conversation-Id", "X-Thread-Id"} {
 		if id := strings.TrimSpace(r.Header.Get(header)); id != "" {
-			return "h:" + id
+			// Scope client ids to the caller's key so different keys can never
+			// share an upstream session by reusing the same id.
+			sum := sha256.Sum256([]byte(tokenFromRequest(r)))
+			return "h:" + hex.EncodeToString(sum[:])[:16] + ":" + id
 		}
 	}
 	h := sha256.New()

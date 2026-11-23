@@ -2,10 +2,10 @@ name: docker
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     tags: ["v*"]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
   workflow_dispatch:
 
 concurrency:
@@ -20,8 +20,29 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
+  test:
+    name: go test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test -race ./...
+
   image:
     name: build and push image
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,13 +70,18 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ steps.image.outputs.name }}
+          # Builds from the dev branch get a -dev suffix on every tag, e.g.
+          # latest-dev and sha-abc1234-dev, so they never overwrite releases.
+          flavor: |
+            suffix=${{ github.ref == 'refs/heads/dev' && '-dev' || '' }}
           tags: |
-            type=ref,event=branch
+            type=ref,event=branch,enable=${{ github.ref != 'refs/heads/dev' }}
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short,prefix=sha-
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/dev' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -74,6 +100,7 @@ jobs:
 
   smoke:
     name: image smoke test (amd64)
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -144,7 +171,9 @@ jobs:
           echo "== rendered config"
           docker exec qw cat /app/data/config.json
           docker exec qw sh -c 'grep -q "0.0.0.0:8080" /app/data/config.json'
-          docker exec qw sh -c 'grep -q "ci-password-123" /app/data/config.json'
+          # WEBUI_PASSWORD is rendered as a PBKDF2 hash; plaintext must not persist.
+          docker exec qw sh -c '! grep -q "ci-password-123" /app/data/config.json'
+          docker exec qw sh -c 'grep -q "pbkdf2-sha256" /app/data/config.json'
           docker exec qw sh -c 'test -f /app/data/quickwork.db'
           echo "== smoke test passed"
 

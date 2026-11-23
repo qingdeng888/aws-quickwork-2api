@@ -55,8 +55,11 @@ func TestApplyEnvOverrides(t *testing.T) {
 	if cfg.Timezone != "Asia/Shanghai" {
 		t.Errorf("timezone = %q", cfg.Timezone)
 	}
-	if cfg.WebUI == nil || cfg.WebUI.Password != "docker-pass-123" {
+	if cfg.WebUI == nil || !cfg.CheckWebUIPassword("docker-pass-123") {
 		t.Fatalf("webui password not applied: %+v", cfg.WebUI)
+	}
+	if cfg.WebUI.Password != "" || !ValidPasswordHash(cfg.WebUI.PasswordHash) {
+		t.Errorf("WEBUI_PASSWORD must be stored hashed only, got plain=%q hash=%q", cfg.WebUI.Password, cfg.WebUI.PasswordHash)
 	}
 	if !cfg.WebUI.TrustProxy {
 		t.Error("trust_proxy should be true")
@@ -140,5 +143,52 @@ func TestApplyEnvValidationCatchesBadCombination(t *testing.T) {
 	}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected Validate to reject an unknown provider")
+	}
+}
+
+func TestApplyEnvKeepsExistingHash(t *testing.T) {
+	adminHash, err := HashPassword("changed-by-admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Default()
+	cfg.WebUI.PasswordHash = adminHash
+	applied, err := ApplyEnv(&cfg, envFrom(map[string]string{"WEBUI_PASSWORD": "from-env-pass"}))
+	if err != nil {
+		t.Fatalf("ApplyEnv: %v", err)
+	}
+	if cfg.WebUI.PasswordHash != adminHash || !cfg.CheckWebUIPassword("changed-by-admin") {
+		t.Error("existing password_hash must not be overridden without WEBUI_PASSWORD_FORCE")
+	}
+	if strings.Contains(strings.Join(applied, ","), "WEBUI_PASSWORD") {
+		t.Errorf("skipped password reported as applied: %v", applied)
+	}
+}
+
+func TestApplyEnvForceOverridesHash(t *testing.T) {
+	adminHash, err := HashPassword("changed-by-admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Default()
+	cfg.WebUI.PasswordHash = adminHash
+	if _, err := ApplyEnv(&cfg, envFrom(map[string]string{
+		"WEBUI_PASSWORD":       "from-env-pass",
+		"WEBUI_PASSWORD_FORCE": "1",
+	})); err != nil {
+		t.Fatalf("ApplyEnv: %v", err)
+	}
+	if !cfg.CheckWebUIPassword("from-env-pass") || cfg.CheckWebUIPassword("changed-by-admin") {
+		t.Error("WEBUI_PASSWORD_FORCE should replace the stored hash")
+	}
+	if cfg.WebUI.Password != "" {
+		t.Error("plaintext must not be persisted")
+	}
+}
+
+func TestApplyEnvRejectsShortPassword(t *testing.T) {
+	cfg := Default()
+	if _, err := ApplyEnv(&cfg, envFrom(map[string]string{"WEBUI_PASSWORD": "short"})); err == nil {
+		t.Fatal("expected short WEBUI_PASSWORD to be rejected")
 	}
 }

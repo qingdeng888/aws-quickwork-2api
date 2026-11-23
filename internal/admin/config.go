@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"quickwork-openai/internal/config"
@@ -118,7 +119,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		source = "hash"
 	}
 	writeJSON(w, http.StatusOK, configResponse{
-		Config:          formFromConfig(fileCfg),
+		Config:          maskForm(formFromConfig(fileCfg)),
 		Paths:           map[string]string{"config": s.cfg.Path, "database": s.cfg.Database},
 		RestartRequired: diffConfig(fileCfg, s.cfg),
 		PasswordSource:  source,
@@ -135,13 +136,25 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	// Serialize read-merge-write so concurrent saves cannot lose updates.
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+
+	path := s.cfg.Path
+	if existing, err := config.Load(path); err == nil {
+		keys, err := unmaskAPIKeys(input.APIKeys, existing.APIKeys)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_config", err.Error())
+			return
+		}
+		input.APIKeys = keys
+	}
 	form, err := normalizeForm(input)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_config", err.Error())
 		return
 	}
 
-	path := s.cfg.Path
 	original, err := os.ReadFile(path)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "config_error", err.Error())
@@ -234,7 +247,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	encodedWebUI, _ := json.Marshal(webuiRaw)
 	raw["webui"] = encodedWebUI
 
-	updated, err := writeConfigAtomic(path, raw, original)
+	updated, err := writeConfigAtomic(path, raw)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_config", err.Error())
 		return
@@ -272,7 +285,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		"restart_required": restart,
 		"password_source":  source,
 		"password_set":     credential.Password != "" || credential.PasswordHash != "",
-		"config":           formFromConfig(updated),
+		"config":           maskForm(formFromConfig(updated)),
 		"paths":            map[string]string{"config": path, "database": s.cfg.Database},
 	})
 }
@@ -387,14 +400,33 @@ func normalizeForm(input configForm) (configForm, error) {
 // writeConfigAtomic writes the merged JSON to a temp file, validates it by
 // loading it back, and only then renames it over config.json. A failed
 // validation leaves the original file untouched.
-func writeConfigAtomic(path string, raw map[string]json.RawMessage, original []byte) (*config.Config, error) {
+func writeConfigAtomic(path string, raw map[string]json.RawMessage) (*config.Config, error) {
 	body, err := json.MarshalIndent(raw, "", "  ")
 	if err != nil {
 		return nil, err
 	}
 	body = append(body, '\n')
-	tmp := filepath.Join(filepath.Dir(path), ".config.json.tmp")
-	if err := os.WriteFile(tmp, body, 0o600); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), ".config.json.*.tmp")
+	if err != nil {
+		return nil, err
+	}
+	tmp := f.Name()
+	fail := func(err error) (*config.Config, error) {
+		f.Close()
+		_ = os.Remove(tmp)
+		return nil, err
+	}
+	if err := f.Chmod(0o600); err != nil {
+		return fail(err)
+	}
+	if _, err := f.Write(body); err != nil {
+		return fail(err)
+	}
+	if err := f.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return nil, err
 	}
 	updated, err := config.Load(tmp)
@@ -407,8 +439,58 @@ func writeConfigAtomic(path string, raw map[string]json.RawMessage, original []b
 		return nil, err
 	}
 	updated.Path = path
-	_ = original
 	return updated, nil
+}
+
+// configWriteMu serializes PUT /config read-merge-write cycles.
+var configWriteMu sync.Mutex
+
+// maskAPIKey hides all but a short prefix and suffix of a key.
+func maskAPIKey(key string) string {
+	if len(key) <= 10 {
+		return "…****"
+	}
+	return key[:3] + "…" + key[len(key)-4:]
+}
+
+func maskAPIKeys(keys []string) []string {
+	out := make([]string, len(keys))
+	for i, key := range keys {
+		out[i] = maskAPIKey(key)
+	}
+	return out
+}
+
+func maskForm(form configForm) configForm {
+	form.APIKeys = maskAPIKeys(form.APIKeys)
+	return form
+}
+
+// unmaskAPIKeys maps masked placeholders back to the stored key they stand
+// for ("keep unchanged"). Values without the mask marker are new keys.
+func unmaskAPIKeys(submitted, existing []string) ([]string, error) {
+	out := make([]string, 0, len(submitted))
+	for _, key := range submitted {
+		trimmed := strings.TrimSpace(key)
+		if !strings.Contains(trimmed, "…") {
+			out = append(out, key)
+			continue
+		}
+		matched := ""
+		for _, candidate := range existing {
+			if maskAPIKey(candidate) == trimmed {
+				if matched != "" && matched != candidate {
+					return nil, fmt.Errorf("masked api key %q is ambiguous; re-enter it in full", trimmed)
+				}
+				matched = candidate
+			}
+		}
+		if matched == "" {
+			return nil, fmt.Errorf("masked api key %q does not match a stored key", trimmed)
+		}
+		out = append(out, matched)
+	}
+	return out, nil
 }
 
 // diffConfig lists the fields where the running process differs from the file

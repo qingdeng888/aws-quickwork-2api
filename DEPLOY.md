@@ -270,7 +270,7 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 
 优先级是「环境变量 > 文件里已有的值」，空变量不覆盖。想完全不接管配置文件，设 `CONFIG_FROM_ENV=false`。
 
-注意密码的归属：`.env` 里的 `WEBUI_PASSWORD` 每次重建都会写回 `config.json`，所以在 `/admin` 里改的密码会被它覆盖。要以页面修改为准，就把 `.env` 的 `WEBUI_PASSWORD` 留空，或用 `WEBUI_PASSWORD_HASH`，或直接 `CONFIG_FROM_ENV=false`。
+注意密码的归属：`.env` 里的 `WEBUI_PASSWORD` 渲染时会先转成 PBKDF2 哈希再写入 `config.json`（明文不落盘）。一旦文件里已经有 `password_hash`（例如你在 `/admin` 里改过密码），后续启动默认不再用 env 覆盖它；需要强制以 env 为准时设 `WEBUI_PASSWORD_FORCE=1`。也可以用 `CONFIG_FROM_ENV=false` 完全关闭合并。
 
 #### 容器内登录上游
 

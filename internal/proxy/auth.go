@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"net/http"
 	"strings"
 )
@@ -23,17 +25,21 @@ func adminAuthenticated(r *http.Request) bool {
 // APIKeyAuth validates local proxy API keys from config.json. An empty key
 // list disables authentication for local-only deployments.
 type APIKeyAuth struct {
-	keys map[string]bool
+	// digests holds sha256 of each key so comparisons are fixed length and
+	// constant time.
+	digests [][sha256.Size]byte
 }
 
 func NewAPIKeyAuth(keys []string) *APIKeyAuth {
-	set := make(map[string]bool, len(keys))
+	seen := make(map[string]bool, len(keys))
+	digests := make([][sha256.Size]byte, 0, len(keys))
 	for _, key := range keys {
-		if key = strings.TrimSpace(key); key != "" {
-			set[key] = true
+		if key = strings.TrimSpace(key); key != "" && !seen[key] {
+			seen[key] = true
+			digests = append(digests, sha256.Sum256([]byte(key)))
 		}
 	}
-	return &APIKeyAuth{keys: set}
+	return &APIKeyAuth{digests: digests}
 }
 
 func tokenFromRequest(r *http.Request) string {
@@ -50,12 +56,18 @@ func tokenFromRequest(r *http.Request) string {
 
 // Allowed reports whether the request may use the proxy.
 func (a *APIKeyAuth) Allowed(r *http.Request) bool {
-	if len(a.keys) == 0 {
+	if len(a.digests) == 0 {
 		return true
 	}
 	token := tokenFromRequest(r)
 	if token == "" {
 		return false
 	}
-	return a.keys[token]
+	got := sha256.Sum256([]byte(token))
+	match := 0
+	// Check every key so timing does not reveal which one matched.
+	for i := range a.digests {
+		match |= subtle.ConstantTimeCompare(got[:], a.digests[i][:])
+	}
+	return match == 1
 }

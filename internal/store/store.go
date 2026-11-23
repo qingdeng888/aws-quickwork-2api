@@ -83,32 +83,34 @@ func Open(path string) (*Store, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("database path is empty")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	// The directory holds refresh tokens and client secrets.
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", path)
+	// PRAGMAs live in the DSN so every (re)opened connection gets them, not
+	// just the first one.
+	dsn := path + "?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	for _, pragma := range []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA busy_timeout=10000",
-		"PRAGMA foreign_keys=ON",
-	} {
-		if _, err := db.Exec(pragma); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("%s: %w", pragma, err)
-		}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
 	}
-	// The database holds refresh tokens and client secrets.
-	_ = os.Chmod(path, 0o600)
+	// The database and its WAL/shm side files hold the same secrets.
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if _, err := os.Stat(p); err == nil {
+			_ = os.Chmod(p, 0o600)
+		}
+	}
 	return s, nil
 }
 
@@ -229,7 +231,7 @@ ON CONFLICT(email, tenant_url) DO UPDATE SET
 	expires_at=excluded.expires_at,
 	obtained_at=excluded.obtained_at,
 	updated_at=excluded.updated_at,
-	disabled=0,
+	disabled=accounts.disabled,
 	last_error=''
 RETURNING id`
 	err := s.db.QueryRowContext(ctx, q,

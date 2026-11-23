@@ -183,7 +183,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleEndpoints(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg
 	scheme := "http"
-	if requestIsSecure(r) {
+	if requestIsSecure(r, s.webui().TrustProxy) {
 		scheme = "https"
 	}
 	base := scheme + "://" + r.Host

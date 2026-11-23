@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // FunctionCall is the OpenAI function payload. Arguments is a JSON string on
@@ -205,7 +206,8 @@ func roleLabel(role string) string {
 	if role == "" {
 		return "User"
 	}
-	return strings.ToUpper(role[:1]) + strings.ToLower(role[1:])
+	r, size := utf8.DecodeRuneInString(role)
+	return strings.ToUpper(string(r)) + strings.ToLower(role[size:])
 }
 
 // formatPrompt converts an OpenAI transcript into the single text field that

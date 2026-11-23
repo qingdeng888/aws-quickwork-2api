@@ -255,12 +255,19 @@ func cborEncodeInto(v any, out *[]byte) error {
 	return nil
 }
 
+// cborMaxDepth bounds nesting of arrays, maps and tags so hostile input cannot
+// exhaust the stack.
+const cborMaxDepth = 64
+
 func cborDecode(data []byte) (any, error) {
-	v, _, err := cborDecodeAt(data, 0)
+	v, _, err := cborDecodeAt(data, 0, 0)
 	return v, err
 }
 
-func cborDecodeAt(data []byte, i int) (any, int, error) {
+func cborDecodeAt(data []byte, i int, depth int) (any, int, error) {
+	if depth > cborMaxDepth {
+		return nil, i, fmt.Errorf("CBOR nesting exceeds %d", cborMaxDepth)
+	}
 	if i >= len(data) {
 		return nil, i, fmt.Errorf("truncated CBOR")
 	}
@@ -300,26 +307,31 @@ func cborDecodeAt(data []byte, i int) (any, int, error) {
 		return nil, i, fmt.Errorf("unsupported CBOR additional info %d", info)
 	}
 
+	remaining := uint64(len(data) - i)
 	switch major {
 	case 0:
 		return n, i, nil
 	case 1:
 		return -1 - int64(n), i, nil
 	case 2:
-		if i+int(n) > len(data) {
+		if n > remaining {
 			return nil, i, fmt.Errorf("truncated CBOR bytes")
 		}
 		out := append([]byte(nil), data[i:i+int(n)]...)
 		return out, i + int(n), nil
 	case 3:
-		if i+int(n) > len(data) {
+		if n > remaining {
 			return nil, i, fmt.Errorf("truncated CBOR string")
 		}
 		return string(data[i : i+int(n)]), i + int(n), nil
 	case 4:
+		// Every item needs at least one byte, so remaining bounds the count.
+		if n > remaining {
+			return nil, i, fmt.Errorf("truncated CBOR array")
+		}
 		arr := make([]any, 0, n)
 		for k := uint64(0); k < n; k++ {
-			item, ni, err := cborDecodeAt(data, i)
+			item, ni, err := cborDecodeAt(data, i, depth+1)
 			if err != nil {
 				return nil, ni, err
 			}
@@ -328,14 +340,18 @@ func cborDecodeAt(data []byte, i int) (any, int, error) {
 		}
 		return arr, i, nil
 	case 5:
+		// Every pair needs at least two bytes.
+		if n > remaining/2 {
+			return nil, i, fmt.Errorf("truncated CBOR map")
+		}
 		m := make(map[string]any, n)
 		for k := uint64(0); k < n; k++ {
-			key, ni, err := cborDecodeAt(data, i)
+			key, ni, err := cborDecodeAt(data, i, depth+1)
 			if err != nil {
 				return nil, ni, err
 			}
 			i = ni
-			val, ni, err := cborDecodeAt(data, i)
+			val, ni, err := cborDecodeAt(data, i, depth+1)
 			if err != nil {
 				return nil, ni, err
 			}
@@ -345,7 +361,7 @@ func cborDecodeAt(data []byte, i int) (any, int, error) {
 		return m, i, nil
 	case 6:
 		// Tag: decode the tagged value and ignore the tag itself.
-		return cborDecodeAt(data, i)
+		return cborDecodeAt(data, i, depth+1)
 	case 7:
 		switch info {
 		case 20:

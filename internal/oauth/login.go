@@ -539,7 +539,10 @@ func decodeJSONResponse(endpoint string, res httpResult) (map[string]any, error)
 		host = u.Host
 	}
 	if res.status < 200 || res.status >= 300 {
-		return nil, fmt.Errorf("HTTP %d from %s: %s", res.status, host, safeBody(res.body))
+		if code := errorCode(res.body); code != "" {
+			return nil, fmt.Errorf("HTTP %d from %s (error=%s)", res.status, host, code)
+		}
+		return nil, fmt.Errorf("HTTP %d from %s", res.status, host)
 	}
 	var raw map[string]any
 	if err := json.Unmarshal(res.body, &raw); err != nil {
@@ -621,12 +624,36 @@ func randomToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
-func safeBody(raw []byte) string {
-	s := strings.TrimSpace(string(raw))
-	if len(s) > 300 {
-		s = s[:300]
+// errorCode extracts a short, sanitized OAuth/AWS error code from an error
+// response body. It never returns free-form text, so response bodies and any
+// token values they may contain are not embedded in error strings.
+func errorCode(raw []byte) string {
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return ""
 	}
-	return s
+	for _, key := range []string{"error", "__type", "code", "errorCode"} {
+		s, ok := obj[key].(string)
+		if !ok {
+			continue
+		}
+		if i := strings.LastIndex(s, "#"); i >= 0 {
+			s = s[i+1:]
+		}
+		var b strings.Builder
+		for _, r := range s {
+			if b.Len() >= 64 {
+				break
+			}
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+				b.WriteRune(r)
+			}
+		}
+		if b.Len() > 0 {
+			return b.String()
+		}
+	}
+	return ""
 }
 
 func formatEpoch(v int64) string {

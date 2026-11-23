@@ -112,7 +112,10 @@ func runServer(args []string) int {
 	defer st.Close()
 
 	mgr := accounts.New(st, cfg)
-	count, _ := mgr.EnabledCount(context.Background())
+	count, err := mgr.EnabledCount(context.Background())
+	if err != nil {
+		log.Printf("count enabled accounts: %v", err)
+	}
 	px := proxy.NewServer(cfg, mgr)
 	adminUI := admin.New(cfg, st, mgr, px)
 	px.MountAdmin("/admin/", adminUI.Handler())

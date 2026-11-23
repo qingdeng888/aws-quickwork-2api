@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"quickwork-openai/internal/accounts"
@@ -138,6 +139,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var req ChatRequest
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20))
 	if err := dec.Decode(&req); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds the size limit")
+			return
+		}
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON body: "+err.Error())
 		return
 	}
@@ -172,7 +178,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		instructions = systemPromptText
 	}
 
-	conv := s.sessions.acquire(conversationKey(r, &req, systemPromptText))
+	conv, err := s.sessions.acquire(r.Context(), conversationKey(r, &req, systemPromptText))
+	if err != nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "request_cancelled", "request ended while waiting for the conversation: "+err.Error())
+		return
+	}
 	defer s.sessions.release(conv)
 
 	resume := false
@@ -356,17 +366,27 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusInternalServerError, "streaming_unavailable", "response writer does not support flushing")
 		return
 	}
+	// started means the role chunk (real content) reached the client, so a
+	// retry is no longer possible. headersSent only means the SSE response
+	// began, e.g. for keep-alive comments while the tool bridge buffers.
 	started := false
-	writeRaw := func(payload map[string]any) {
-		body, _ := json.Marshal(payload)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", body)
+	headersSent := false
+	var writeMu sync.Mutex
+	writeLine := func(s string) {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		_, _ = fmt.Fprint(w, s)
 		flusher.Flush()
 	}
-	ensureStarted := func() {
-		if started {
+	writeRaw := func(payload map[string]any) {
+		body, _ := json.Marshal(payload)
+		writeLine("data: " + string(body) + "\n\n")
+	}
+	sendHeaders := func() {
+		if headersSent {
 			return
 		}
-		started = true
+		headersSent = true
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -375,6 +395,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("X-Thread-Id", threadID)
 		}
 		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+	}
+	ensureStarted := func() {
+		if started {
+			return
+		}
+		started = true
+		sendHeaders()
 		writeRaw(map[string]any{
 			"id":      id,
 			"object":  "chat.completion.chunk",
@@ -404,16 +432,57 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			}},
 		})
 	}
+	// writeStreamError ends a stream consistently: if a role chunk was sent,
+	// close the choice with finish_reason "stop", then emit the error object
+	// and [DONE].
 	writeStreamError := func(message string) {
-		writePayload(map[string]any{"error": map[string]any{
+		if started {
+			writeChunk(map[string]any{}, "stop")
+		}
+		sendHeaders()
+		writeRaw(map[string]any{"error": map[string]any{
 			"message": message,
 			"type":    "upstream_error",
 			"code":    "upstream_error",
 		}})
+		writeLine("data: [DONE]\n\n")
 	}
 
 	sawVisibleText := false
 	var bridgeBuffer strings.Builder
+
+	// While the tool bridge buffers the whole answer, keep idle proxies and
+	// clients from timing out with SSE comments. Only headers and comments
+	// are sent, never the role chunk, so failed attempts can still retry.
+	stopHeartbeat := func() {}
+	if bridgeActive {
+		sendHeaders()
+		hbDone := make(chan struct{})
+		hbExited := make(chan struct{})
+		go func() {
+			defer close(hbExited)
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-hbDone:
+					return
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					writeLine(": keep-alive\n\n")
+				}
+			}
+		}()
+		var once sync.Once
+		stopHeartbeat = func() {
+			once.Do(func() {
+				close(hbDone)
+				<-hbExited
+			})
+		}
+	}
+	defer stopHeartbeat()
 
 	var res ChatResult
 	var lastErr error
@@ -483,9 +552,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		sawVisibleText = false
 		bridgeBuffer.Reset()
 	}
+	stopHeartbeat()
 	if lastErr != nil {
 		conv.reset()
-		if !started {
+		// Once heartbeat headers are out, a JSON error status is no longer
+		// possible; fall through to the in-stream error instead.
+		if !started && !headersSent {
 			status, code := http.StatusBadGateway, "upstream_error"
 			switch {
 			case errors.Is(lastErr, accounts.ErrNoAccounts):
@@ -499,8 +571,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
 		writeStreamError(lastErr.Error())
-		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-		flusher.Flush()
 		return
 	}
 	if s.cfg.SessionReuse && res.ThreadID != "" {
@@ -528,16 +598,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			errEmpty := fmt.Errorf("upstream returned no visible text or tool calls (completion_tokens=%d)", res.Usage.CompletionTokens)
 			s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
 			writeStreamError(errEmpty.Error())
-			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-			flusher.Flush()
 			return
 		}
 	} else if !sawVisibleText {
+		// Without declared tools there is no bridge, so upstream-native tool
+		// calls cannot be mapped to the caller and are dropped here.
+		if len(res.ToolCalls) > 0 {
+			log.Printf("chat %s dropping %d upstream-native tool call(s): the request declared no tools", id, len(res.ToolCalls))
+		}
 		errEmpty := fmt.Errorf("upstream returned no visible text (completion_tokens=%d)", res.Usage.CompletionTokens)
 		s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
 		writeStreamError(errEmpty.Error())
-		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-		flusher.Flush()
 		return
 	}
 	if hasVisibleText(outText) {
