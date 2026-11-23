@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"quickwork-openai/internal/accounts"
 	"quickwork-openai/internal/config"
+	"quickwork-openai/internal/netproxy"
 	"quickwork-openai/internal/store"
 )
 
@@ -268,8 +270,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 					id, attempt, maxAttempts, accountLogLabel(acct), err)
 				continue
 			}
-			log.Printf("chat %s attempt=%d/%d account=%s", id, attempt, maxAttempts, accountLogLabel(acct))
-			res, err = s.upstream.Chat(ctx, sess, in, nil)
+			proxyURL, proxyErr := s.accounts.ResolveProxy(ctx, acct)
+			if proxyErr != nil {
+				lastErr = proxyErr
+				log.Printf("chat %s attempt=%d/%d account=%s proxy error=%v",
+					id, attempt, maxAttempts, accountLogLabel(acct), proxyErr)
+				continue
+			}
+			sess.Proxy = proxyURL
+			attemptCtx := netproxy.WithProxy(ctx, proxyURL)
+			log.Printf("chat %s attempt=%d/%d account=%s proxy=%s", id, attempt, maxAttempts, accountLogLabel(acct), proxyLogLabel(proxyURL))
+			res, err = s.upstream.Chat(attemptCtx, sess, in, nil)
 			if err == nil {
 				lastErr = nil
 				break
@@ -503,8 +514,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				id, attempt, maxAttempts, accountLogLabel(acct), err)
 			continue
 		}
-		log.Printf("chat %s attempt=%d/%d account=%s", id, attempt, maxAttempts, accountLogLabel(acct))
-		res, err = s.upstream.Chat(ctx, sess, in, func(ev StreamEvent) error {
+		proxyURL, proxyErr := s.accounts.ResolveProxy(ctx, acct)
+		if proxyErr != nil {
+			lastErr = proxyErr
+			log.Printf("chat %s attempt=%d/%d account=%s proxy error=%v",
+				id, attempt, maxAttempts, accountLogLabel(acct), proxyErr)
+			continue
+		}
+		sess.Proxy = proxyURL
+		attemptCtx := netproxy.WithProxy(ctx, proxyURL)
+		log.Printf("chat %s attempt=%d/%d account=%s proxy=%s", id, attempt, maxAttempts, accountLogLabel(acct), proxyLogLabel(proxyURL))
+		res, err = s.upstream.Chat(attemptCtx, sess, in, func(ev StreamEvent) error {
 			if ev.Type == "text" && ev.Text != "" {
 				if bridgeActive {
 					bridgeBuffer.WriteString(ev.Text)
@@ -639,6 +659,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
+}
+
+// proxyLogLabel keeps credentials out of request logs.
+func proxyLogLabel(proxy *url.URL) string {
+	if proxy == nil {
+		return "direct"
+	}
+	return netproxy.Redact(proxy.String())
 }
 
 // accountLogLabel identifies an account in request logs without exposing

@@ -5,13 +5,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"quickwork-openai/internal/config"
+	"quickwork-openai/internal/netproxy"
 	"quickwork-openai/internal/oauth"
+	"quickwork-openai/internal/proxypool"
 	"quickwork-openai/internal/store"
 )
 
@@ -20,8 +23,9 @@ var ErrNoAccounts = errors.New("no accounts configured; run `quickproxy login`")
 
 // Manager rotates over enabled accounts and refreshes tokens on demand.
 type Manager struct {
-	store *store.Store
-	cfg   *config.Config
+	store   *store.Store
+	cfg     *config.Config
+	proxies *proxypool.Pool
 
 	next atomic.Uint64
 
@@ -30,7 +34,17 @@ type Manager struct {
 }
 
 func New(st *store.Store, cfg *config.Config) *Manager {
-	return &Manager{store: st, cfg: cfg, locks: make(map[int64]*sync.Mutex)}
+	return &Manager{store: st, cfg: cfg, proxies: proxypool.New(st), locks: make(map[int64]*sync.Mutex)}
+}
+
+// ProxyPool exposes the shared pool for health checks and the admin API.
+func (m *Manager) ProxyPool() *proxypool.Pool { return m.proxies }
+
+// ResolveProxy returns the outbound proxy for one account: a pinned proxy, a
+// pool pick for accounts that follow the pool, or nil for a direct connection.
+func (m *Manager) ResolveProxy(ctx context.Context, a *store.Account) (*url.URL, error) {
+	enabled := m.cfg.ProxyPool != nil && m.cfg.ProxyPool.Enabled
+	return m.proxies.Resolve(ctx, a, enabled)
 }
 
 func (m *Manager) lockFor(id int64) *sync.Mutex {
@@ -124,6 +138,12 @@ func (m *Manager) ensureFresh(ctx context.Context, a *store.Account) (*store.Acc
 
 // refreshLocked refreshes and persists one account. The caller holds its lock.
 func (m *Manager) refreshLocked(ctx context.Context, a *store.Account) (*store.Account, error) {
+	// Token endpoints go through the account's proxy, like chat traffic.
+	proxyURL, err := m.ResolveProxy(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+	ctx = netproxy.WithProxy(ctx, proxyURL)
 	refreshed, err := oauth.Refresh(ctx, a)
 	if err != nil {
 		return nil, err

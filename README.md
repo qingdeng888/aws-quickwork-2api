@@ -25,7 +25,8 @@
 - `system` / `developer` 消息与工具定义放在本轮 user 文本开头的 `[System instructions from the API caller]` 区块内；上游会忽略每轮 `system_prompt` 字段，并把 `custom_prompt` 当作低信任的个人偏好，user 轮次是唯一可靠送达调用方指令的通道
 - 64 KB 单帧预算按实际 JSON 字节计算：用户内容过大时优先走 out-of-band 附件（`upload-attachment` → DLP 扫描 → `files/upload`），WebSocket 只发送短引用与 `attachments` 元数据；附件只包含用户内容，调用方指令仍留在 WS 文本里。附件不可用时才裁剪、保留开头与结尾，避免直接返回 `request_too_large`
 - `chat_agent_id` 可指定一个 QuickWork 自定义 agent，以替代默认内置 agent 的提示词与工具策略
-- `/admin` 密码保护的管理前端，与 `/v1` 共用端口和进程：账号列表 / 刷新 / 停用 / 删除、账号导出与增量导入、网页内完成 OAuth 登录（手动回填或本机回调）、配置编辑、请求日志与 Playground
+- `/admin` 密码保护的管理前端，与 `/v1` 共用端口和进程：账号列表 / 刷新 / 停用 / 删除、账号导出与增量导入、代理池（增删 / 测试 / 启用停用）、网页内完成 OAuth 登录（手动回填或本机回调）、配置编辑、请求日志与 Playground
+- 出站代理：http / https / socks5 代理池，账号可绑定固定代理、跟随代理池轮询或强制直连；上游 WebSocket、附件上传、token 刷新都走同一套选择
 - 一条 `docker compose up -d` 即可部署：镜像由 GitHub Actions 构建并推送到 GHCR，`.env` 定义端口、管理密码与 API key
 
 ## 环境要求
@@ -218,6 +219,7 @@ for chunk in client.chat.completions.create(
 | `quickproxy export -out accounts.json` | 导出全部账号（默认含 token；`-secrets=false` 只导元数据） |
 | `quickproxy import -in accounts.json` | 增量导入：只新增不存在的账号，已存在的跳过 |
 | `quickproxy import -in accounts.json -update` | 增量导入并更新已存在账号的 token |
+| `quickproxy export -out accounts.json` | 导出时带上代理绑定（按代理 URL 记录），导入到另一套安装后按 URL 重新关联 |
 | `quickproxy logout -all` | 删除全部账号 |
 | `quickproxy logout -account ID` | 删除一个账号 |
 | `quickproxy passwd` | 设置管理密码，写入 `webui.password_hash` 并清空明文 |
@@ -286,7 +288,7 @@ for chunk in client.chat.completions.create(
 - 管理端点带 `Content-Security-Policy: default-src 'self'`、`X-Frame-Options: DENY`、`X-Content-Type-Options: nosniff`，且不返回 CORS 头，避免被第三方页面驱动。
 - `webui.trust_proxy` 默认关闭。挂在反向代理后面又需要按真实客户端 IP 限速时，才打开它并确保代理会覆盖 `X-Forwarded-For`。
 
-管理 API（全部在 `/admin/api` 下）：`POST /auth/login`、`GET /auth/session`、`POST /auth/logout`、`GET /overview`、`GET /endpoints`、`GET /accounts`、`POST /accounts/refresh`、`POST /accounts/{id}/disable`、`POST /accounts/{id}/enable`、`GET /accounts/export`、`POST /accounts/import`、`DELETE /accounts/{id}`、`POST /accounts/login`、`GET /accounts/login/{id}`、`POST /accounts/login/{id}/callback`、`DELETE /accounts/login/{id}`、`GET /config`、`PUT /config`、`GET /logs`、`POST /playground`。
+管理 API（全部在 `/admin/api` 下）：`POST /auth/login`、`GET /auth/session`、`POST /auth/logout`、`GET /overview`、`GET /endpoints`、`GET /accounts`、`POST /accounts/refresh`、`POST /accounts/{id}/disable`、`POST /accounts/{id}/enable`、`GET /accounts/export`、`POST /accounts/import`、`POST /accounts/{id}/proxy`、`GET /proxies`、`POST /proxies`、`POST /proxies/bulk`、`POST /proxies/test`、`POST /proxies/{id}/test`、`POST /proxies/{id}/enable|disable`、`DELETE /proxies/{id}`、`DELETE /accounts/{id}`、`POST /accounts/login`、`GET /accounts/login/{id}`、`POST /accounts/login/{id}/callback`、`DELETE /accounts/login/{id}`、`GET /config`、`PUT /config`、`GET /logs`、`POST /playground`。
 
 ## Docker 部署
 

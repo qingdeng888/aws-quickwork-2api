@@ -46,14 +46,17 @@ type Account struct {
 
 	UserInfo string `json:"-"`
 
-	ExpiresAt  int64  `json:"expires_at"`
-	ObtainedAt int64  `json:"obtained_at"`
-	CreatedAt  int64  `json:"created_at"`
-	UpdatedAt  int64  `json:"updated_at"`
-	LastUsedAt int64  `json:"last_used_at"`
-	UseCount   int64  `json:"use_count"`
-	Disabled   bool   `json:"disabled"`
-	LastError  string `json:"last_error"`
+	ExpiresAt  int64 `json:"expires_at"`
+	ObtainedAt int64 `json:"obtained_at"`
+	CreatedAt  int64 `json:"created_at"`
+	UpdatedAt  int64 `json:"updated_at"`
+	LastUsedAt int64 `json:"last_used_at"`
+	UseCount   int64 `json:"use_count"`
+	// ProxyID selects the outbound proxy: 0 follows the proxy pool, a positive
+	// id pins one proxy, and -1 forces a direct connection.
+	ProxyID   int64  `json:"proxy_id"`
+	Disabled  bool   `json:"disabled"`
+	LastError string `json:"last_error"`
 }
 
 // JWT returns the token used for the upstream WebSocket handshake.
@@ -149,12 +152,65 @@ CREATE TABLE IF NOT EXISTS accounts (
 	last_used_at   INTEGER NOT NULL DEFAULT 0,
 	use_count      INTEGER NOT NULL DEFAULT 0,
 	disabled       INTEGER NOT NULL DEFAULT 0,
-	last_error     TEXT NOT NULL DEFAULT ''
+	last_error     TEXT NOT NULL DEFAULT '',
+	proxy_id       INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email_tenant ON accounts(email, tenant_url);
 CREATE INDEX IF NOT EXISTS idx_accounts_enabled ON accounts(disabled, id);
+CREATE TABLE IF NOT EXISTS proxies (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	url          TEXT NOT NULL UNIQUE,
+	label        TEXT NOT NULL DEFAULT '',
+	enabled      INTEGER NOT NULL DEFAULT 1,
+	healthy      INTEGER NOT NULL DEFAULT 0,
+	latency_ms   INTEGER NOT NULL DEFAULT 0,
+	exit_ip      TEXT NOT NULL DEFAULT '',
+	last_error   TEXT NOT NULL DEFAULT '',
+	last_checked INTEGER NOT NULL DEFAULT 0,
+	created_at   INTEGER NOT NULL DEFAULT 0,
+	updated_at   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_proxies_enabled ON proxies(enabled, id);
 `
-	_, err := s.db.Exec(schema)
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
+	// Databases created before the proxy pool lack the column; add it in place
+	// so an upgrade keeps every account.
+	return s.ensureColumn("accounts", "proxy_id", "INTEGER NOT NULL DEFAULT 0")
+}
+
+// ensureColumn adds a column when an older database schema does not have it.
+func (s *Store) ensureColumn(table, column, ddl string) error {
+	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			ctype   string
+			notnull int
+			dflt    any
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = s.db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + ddl)
 	return err
 }
 
@@ -163,7 +219,7 @@ const columns = `id, email, display_name, provider, build_stage, region,
 	actor_arn, aws_account_id, account_name, client_id, client_secret,
 	issuer_url, idc_region, auth_endpoint, token_endpoint, redirect_uri,
 	user_info, expires_at, obtained_at, created_at, updated_at,
-	last_used_at, use_count, disabled, last_error`
+	last_used_at, use_count, disabled, last_error, proxy_id`
 
 type scanner interface {
 	Scan(dest ...any) error
@@ -178,7 +234,7 @@ func scanAccount(row scanner) (*Account, error) {
 		&a.ActorARN, &a.AWSAccountID, &a.AccountName, &a.ClientID, &a.ClientSecret,
 		&a.IssuerURL, &a.IDCRegion, &a.AuthEndpoint, &a.TokenEndpoint, &a.RedirectURI,
 		&a.UserInfo, &a.ExpiresAt, &a.ObtainedAt, &a.CreatedAt, &a.UpdatedAt,
-		&a.LastUsedAt, &a.UseCount, &disabled, &a.LastError,
+		&a.LastUsedAt, &a.UseCount, &disabled, &a.LastError, &a.ProxyID,
 	)
 	if err != nil {
 		return nil, err
@@ -205,8 +261,8 @@ INSERT INTO accounts (email, display_name, provider, build_stage, region,
 	actor_arn, aws_account_id, account_name, client_id, client_secret,
 	issuer_url, idc_region, auth_endpoint, token_endpoint, redirect_uri,
 	user_info, expires_at, obtained_at, created_at, updated_at,
-	last_used_at, use_count, disabled, last_error)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	last_used_at, use_count, disabled, last_error, proxy_id)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(email, tenant_url) DO UPDATE SET
 	display_name=excluded.display_name,
 	provider=excluded.provider,
@@ -232,6 +288,7 @@ ON CONFLICT(email, tenant_url) DO UPDATE SET
 	obtained_at=excluded.obtained_at,
 	updated_at=excluded.updated_at,
 	disabled=accounts.disabled,
+	proxy_id=accounts.proxy_id,
 	last_error=''
 RETURNING id`
 	err := s.db.QueryRowContext(ctx, q,
@@ -240,7 +297,7 @@ RETURNING id`
 		a.ActorARN, a.AWSAccountID, a.AccountName, a.ClientID, a.ClientSecret,
 		a.IssuerURL, a.IDCRegion, a.AuthEndpoint, a.TokenEndpoint, a.RedirectURI,
 		a.UserInfo, a.ExpiresAt, a.ObtainedAt, a.CreatedAt, a.UpdatedAt,
-		a.LastUsedAt, a.UseCount, disabled, a.LastError,
+		a.LastUsedAt, a.UseCount, disabled, a.LastError, a.ProxyID,
 	).Scan(&a.ID)
 	return err
 }

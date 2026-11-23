@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"quickwork-openai/internal/netproxy"
 	"quickwork-openai/internal/store"
 )
 
@@ -493,7 +494,8 @@ func doRequest(ctx context.Context, method, endpoint string, body io.Reader, hea
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	// Follows the proxy bound to ctx, if any (account refresh uses one).
+	client := netproxy.NewClient(ctx, 30*time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return httpResult{}, err

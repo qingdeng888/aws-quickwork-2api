@@ -267,6 +267,7 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 | `SESSION_REUSE` / `SESSION_TTL` / `KEEP_SESSIONS` | 同名 | 上游会话策略 |
 | `OAUTH_PROVIDER` / `OAUTH_STAGE` / `OAUTH_REGION` / `OAUTH_CALLBACK_PORT` / `OAUTH_TIMEOUT` | 同名 | 网页内登录的预填值 |
 | `WEBUI_ENABLED` / `WEBUI_PASSWORD` / `WEBUI_PASSWORD_HASH` / `WEBUI_SESSION_TTL` / `WEBUI_MAX_ATTEMPTS` / `WEBUI_TRUST_PROXY` | `webui.*` | 管理界面；`_HASH` 优先于 `_PASSWORD` |
+| `PROXY_POOL_ENABLED` / `PROXY_POOL_TEST_URL` / `PROXY_POOL_CHECK_INTERVAL` | `proxy_pool.*` | 代理池开关、测试地址与健康检查间隔 |
 
 优先级是「环境变量 > 文件里已有的值」，空变量不覆盖。想完全不接管配置文件，设 `CONFIG_FROM_ENV=false`。
 

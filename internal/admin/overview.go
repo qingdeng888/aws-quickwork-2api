@@ -28,6 +28,8 @@ type accountView struct {
 	CreatedAt    int64  `json:"created_at"`
 	LastUsedAt   int64  `json:"last_used_at"`
 	UseCount     int64  `json:"use_count"`
+	ProxyID      int64  `json:"proxy_id"`
+	ProxyLabel   string `json:"proxy_label"`
 	Disabled     bool   `json:"disabled"`
 	LastError    string `json:"last_error"`
 	HasRefresh   bool   `json:"has_refresh"`
@@ -49,6 +51,7 @@ func viewAccount(a *store.Account, refreshBefore time.Duration) accountView {
 	}
 	view := accountView{
 		ID:           a.ID,
+		ProxyID:      a.ProxyID,
 		Label:        accountLabel(a),
 		Email:        a.Email,
 		DisplayName:  a.DisplayName,

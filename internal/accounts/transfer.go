@@ -57,6 +57,10 @@ type TransferAccount struct {
 	ObtainedAt int64 `json:"obtained_at,omitempty"`
 	CreatedAt  int64 `json:"created_at,omitempty"`
 	Disabled   bool  `json:"disabled,omitempty"`
+	// ProxyURL mirrors the proxy binding as a URL, because proxy ids are local
+	// to one installation. Direct forces a direct connection (no pool).
+	ProxyURL string `json:"proxy_url,omitempty"`
+	Direct   bool   `json:"proxy_direct,omitempty"`
 }
 
 // ExportResult is one export plus the counts the caller may want to show.
@@ -77,6 +81,12 @@ func Export(ctx context.Context, st *store.Store, includeSecrets bool) (*ExportR
 		Version:    TransferVersion,
 		ExportedAt: time.Now().UTC(),
 		Accounts:   make([]TransferAccount, 0, len(list)),
+	}
+	proxyURLs := make(map[int64]string)
+	if proxies, err := st.ListProxies(ctx); err == nil {
+		for _, proxy := range proxies {
+			proxyURLs[proxy.ID] = proxy.URL
+		}
 	}
 	res := &ExportResult{File: file, Secrets: includeSecrets, AccountCount: len(list)}
 	for i := range list {
@@ -101,6 +111,12 @@ func Export(ctx context.Context, st *store.Store, includeSecrets bool) (*ExportR
 			ObtainedAt:   account.ObtainedAt,
 			CreatedAt:    account.CreatedAt,
 			Disabled:     account.Disabled,
+		}
+		switch {
+		case account.ProxyID < 0:
+			entry.Direct = true
+		case account.ProxyID > 0:
+			entry.ProxyURL = proxyURLs[account.ProxyID]
 		}
 		if includeSecrets {
 			entry.AccessToken = account.AccessToken
@@ -143,6 +159,12 @@ func Import(ctx context.Context, st *store.Store, file *TransferFile, update boo
 	existingList, err := st.List(ctx)
 	if err != nil {
 		return res, err
+	}
+	proxyIDs := make(map[string]int64)
+	if proxies, err := st.ListProxies(ctx); err == nil {
+		for _, proxy := range proxies {
+			proxyIDs[proxy.URL] = proxy.ID
+		}
 	}
 	type key struct{ email, tenant string }
 	existing := make(map[key]*store.Account, len(existingList))
@@ -203,6 +225,14 @@ func Import(ctx context.Context, st *store.Store, file *TransferFile, update boo
 			CreatedAt:     entry.CreatedAt,
 			Disabled:      entry.Disabled,
 		}
+		switch {
+		case entry.Direct:
+			account.ProxyID = -1
+		case strings.TrimSpace(entry.ProxyURL) != "":
+			// The target installation may have the same proxy under a new id;
+			// when it is absent the account follows the local pool instead.
+			account.ProxyID = proxyIDs[strings.TrimSpace(entry.ProxyURL)]
+		}
 		if account.Provider == "" {
 			account.Provider = "social"
 		}
@@ -216,6 +246,9 @@ func Import(ctx context.Context, st *store.Store, file *TransferFile, update boo
 			account.CreatedAt = current.CreatedAt
 			account.UseCount = current.UseCount
 			account.LastUsedAt = current.LastUsedAt
+			if !entry.Direct && strings.TrimSpace(entry.ProxyURL) == "" {
+				account.ProxyID = current.ProxyID
+			}
 			if err := st.Save(ctx, account); err != nil {
 				res.Errors = append(res.Errors, fmt.Sprintf("account %d (%s): %v", i+1, email, err))
 				continue

@@ -159,6 +159,19 @@ func runServer(args []string) int {
 	log.Printf("account refresh: window=%s sweep=%s", cfg.RefreshBefore.Duration(), refreshInterval)
 	go mgr.KeepFresh(stop, refreshInterval, log.Printf)
 
+	// Proxy health: accounts in pool mode rotate over the enabled proxies, so a
+	// dead exit should be detected before a chat request pays for it.
+	if cfg.ProxyPool != nil && cfg.ProxyPool.Enabled {
+		proxies, err := st.EnabledProxies(context.Background())
+		if err != nil {
+			log.Printf("proxy pool: %v", err)
+		} else if len(proxies) > 0 {
+			log.Printf("proxy pool: enabled=%d sweep=%s test_url=%s",
+				len(proxies), cfg.ProxyPool.CheckInterval.Duration(), cfg.ProxyPool.TestURL)
+			go mgr.ProxyPool().KeepChecked(stop, cfg.ProxyPool.CheckInterval.Duration(), cfg.ProxyPool.TestURL, log.Printf)
+		}
+	}
+
 	listenErr := make(chan error, 1)
 	go func() {
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

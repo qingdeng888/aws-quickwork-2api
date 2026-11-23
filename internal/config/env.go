@@ -129,6 +129,15 @@ func ApplyEnv(cfg *Config, lookup LookupEnv) ([]string, error) {
 		{"OAUTH_CALLBACK_PORT", number(&cfg.OAuth.CallbackPort)},
 		{"OAUTH_TIMEOUT", duration(&cfg.OAuth.Timeout)},
 	}
+	if cfg.ProxyPool == nil {
+		defaults := Default()
+		cfg.ProxyPool = defaults.ProxyPool
+	}
+	overrides = append(overrides,
+		override{"PROXY_POOL_ENABLED", boolean(&cfg.ProxyPool.Enabled)},
+		override{"PROXY_POOL_TEST_URL", text(&cfg.ProxyPool.TestURL)},
+		override{"PROXY_POOL_CHECK_INTERVAL", duration(&cfg.ProxyPool.CheckInterval)},
+	)
 	for _, item := range overrides {
 		if err := apply(item.name, item.apply); err != nil {
 			return applied, err

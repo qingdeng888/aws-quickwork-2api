@@ -8,6 +8,7 @@ const state = {
   overview: null,
   endpoints: null,
   accounts: [],
+  proxies: [],
   config: null,
   logs: { items: [], stats: null },
   logFilter: 'all',
@@ -22,7 +23,8 @@ const state = {
 const PAGES = {
   overview: { title: '总览', eyebrow: 'SECTION 01 / RUNTIME', load: pageOverview },
   accounts: { title: '账号', eyebrow: 'SECTION 02 / ACCOUNTS', load: pageAccounts },
-  login: { title: '登录上游', eyebrow: 'SECTION 03 / OAUTH', load: pageLogin },
+  proxies: { title: '代理池', eyebrow: 'SECTION 03 / PROXY POOL', load: pageProxies },
+  login: { title: '登录上游', eyebrow: 'SECTION 04 / OAUTH', load: pageLogin },
   config: { title: '配置', eyebrow: 'SECTION 04 / CONFIG', load: pageConfig },
   logs: { title: '请求日志', eyebrow: 'SECTION 05 / TRAFFIC', load: pageLogs },
   playground: { title: 'Playground', eyebrow: 'SECTION 06 / CHAT', load: pagePlayground },
@@ -378,8 +380,12 @@ function renderOverview() {
 /* ---------- accounts ---------- */
 
 async function pageAccounts() {
-  const data = await api('/accounts');
+  const [data, proxyData] = await Promise.all([
+    api('/accounts'),
+    api('/proxies').catch(() => ({ proxies: [] })),
+  ]);
   state.accounts = data.accounts || [];
+  state.proxies = proxyData.proxies || [];
   renderAccounts();
   state.refreshTimer = setInterval(async () => {
     if (state.page !== 'accounts' || document.hidden) return;
@@ -424,6 +430,7 @@ function renderAccounts() {
       <td>${badge(expiry.text, expiry.cls)}<div class="cell-sub">${esc(formatEpochClock(account.expires_at))}</div></td>
       <td class="mono">${formatNumber(account.use_count)}</td>
       <td class="cell-sub truncate" title="${esc(account.last_error)}">${esc(account.last_error || '—')}</td>
+      <td><select class="proxy-select" data-proxy-select data-account="${account.id}">${proxyOptions(account)}</select></td>
       <td class="actions">
         <button class="btn ghost sm" type="button" data-action="refresh" data-id="${account.id}">刷新</button>
         <button class="btn ghost sm" type="button" data-action="toggle" data-id="${account.id}" data-disabled="${account.status === 'disabled' ? '1' : '0'}">${account.status === 'disabled' ? '启用' : '停用'}</button>
@@ -440,11 +447,27 @@ function renderAccounts() {
           <span class="hint">${state.accounts.length} 个账号 · 同一 email + tenant 重复登录会更新而不是新增</span>
         </div>
         ${state.accounts.length ? `<div class="table-wrap"><table>
-          <thead><tr><th>ID</th><th>账号</th><th>区域</th><th>状态</th><th>到期</th><th>使用</th><th>最近错误</th><th></th></tr></thead>
+          <thead><tr><th>ID</th><th>账号</th><th>区域</th><th>状态</th><th>到期</th><th>使用</th><th>最近错误</th><th>出站代理</th><th></th></tr></thead>
           <tbody>${rows}</tbody>
         </table></div>` : '<div class="empty">还没有账号<br /><span class="faint">运行 quickproxy login，或在「登录上游」里走一遍 OAuth</span></div>'}
       </div>
     </div>`;
+
+  $$('[data-proxy-select]', content()).forEach((select) => {
+    select.addEventListener('change', async () => {
+      const id = Number(select.dataset.account);
+      const proxyID = Number(select.value);
+      select.disabled = true;
+      try {
+        await api(`/accounts/${id}/proxy`, { method: 'POST', body: { proxy_id: proxyID } });
+        toast(proxyID === -1 ? '账号改为直连' : proxyID === 0 ? '账号跟随代理池' : `账号已绑定代理 #${proxyID}`);
+        await pageAccounts();
+      } catch (error) {
+        toast(error.message, 'err');
+        select.disabled = false;
+      }
+    });
+  });
 
   $$('[data-action]', content()).forEach((button) => {
     button.addEventListener('click', async () => {
@@ -575,6 +598,191 @@ async function refreshAllAccounts(button) {
     await pageAccounts();
   } catch (error) {
     toast(error.message, 'err');
+  } finally {
+    if (button.isConnected) {
+      button.disabled = false;
+      button.textContent = original;
+    }
+  }
+}
+
+function proxyOptions(account) {
+  const current = String(account.proxy_id === undefined ? 0 : account.proxy_id);
+  const options = [
+    { value: '-1', label: '直连（不走代理）' },
+    { value: '0', label: '跟随代理池' },
+  ].concat((state.proxies || []).map((proxy) => ({
+    value: String(proxy.id),
+    label: `#${proxy.id} ${proxy.label || proxy.url}${proxy.enabled ? '' : '（已停用）'}`,
+  })));
+  return options
+    .map((option) => `<option value="${option.value}" ${current === option.value ? 'selected' : ''}>${esc(option.label)}</option>`)
+    .join('');
+}
+
+/* ---------- proxy pool ---------- */
+
+async function pageProxies() {
+  setTopActions([
+    { label: '测试全部', onClick: (button) => testAllProxies(button) },
+  ]);
+  const data = await api('/proxies');
+  state.proxies = data.proxies || [];
+  renderProxies(data);
+}
+
+function proxyStatus(proxy) {
+  if (!proxy.enabled) return badge('已停用', 'plain');
+  if (!proxy.last_checked) return badge('未测试', 'info');
+  return proxy.healthy ? badge(`正常 · ${proxy.latency_ms}ms`, 'ok') : badge('连接失败', 'danger');
+}
+
+function renderProxies(data) {
+  const pool = data.pool || {};
+  const rows = state.proxies.map((proxy) => `<tr>
+      <td class="mono">${proxy.id}</td>
+      <td>
+        <div class="cell-main truncate" title="${esc(proxy.url)}">${esc(proxy.label || proxy.url)}</div>
+        ${proxy.label ? `<div class="cell-sub truncate" title="${esc(proxy.url)}">${esc(proxy.url)}</div>` : ''}
+      </td>
+      <td>${proxyStatus(proxy)}</td>
+      <td class="mono">${proxy.exit_ip ? esc(proxy.exit_ip) : '—'}</td>
+      <td class="mono">${proxy.bound_accounts || 0}</td>
+      <td class="cell-sub truncate" title="${esc(proxy.last_error)}">${esc(proxy.last_error || '—')}</td>
+      <td class="actions">
+        <button class="btn ghost sm" type="button" data-proxy-action="test" data-id="${proxy.id}">测试</button>
+        <button class="btn ghost sm" type="button" data-proxy-action="${proxy.enabled ? 'disable' : 'enable'}" data-id="${proxy.id}">${proxy.enabled ? '停用' : '启用'}</button>
+        <button class="btn danger sm" type="button" data-proxy-action="delete" data-id="${proxy.id}">删除</button>
+      </td>
+    </tr>`).join('');
+
+  content().innerHTML = `
+    <div class="page">
+      <div class="card">
+        <div class="card-head">
+          <h2>代理池</h2>
+          <span class="hint">${state.proxies.length} 个代理 · 代理池${pool.enabled ? '已启用' : '已停用（跟随池的账号按直连处理）'} · 测试地址 ${esc(pool.test_url || '')}</span>
+        </div>
+        ${state.proxies.length ? `<div class="table-wrap"><table>
+          <thead><tr><th>ID</th><th>代理</th><th>状态</th><th>出口 IP</th><th>绑定账号</th><th>最近错误</th><th></th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table></div>` : '<div class="empty">代理池还是空的<br /><span class="faint">支持 http / https / socks5，地址里可以带 user:pass</span></div>'}
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>添加代理</h2><span class="hint">每行一个，重复的会自动跳过；添加后可用「测试」验证出口</span></div>
+        <textarea id="proxy-bulk" rows="4" placeholder="http://user:pass@1.2.3.4:8080&#10;socks5://5.6.7.8:1080" style="width:100%"></textarea>
+        <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <button class="btn primary sm" id="proxy-add" type="button">添加到代理池</button>
+          <input id="proxy-test-input" placeholder="测试未保存的代理，如 http://1.2.3.4:8080" style="flex:1;min-width:260px" />
+          <button class="btn ghost sm" id="proxy-test-unsaved" type="button">测试</button>
+        </div>
+        <div id="proxy-test-result" class="hint" style="margin-top:8px"></div>
+      </div>
+    </div>`;
+
+  $('#proxy-add').addEventListener('click', addProxiesFromText);
+  $('#proxy-test-unsaved').addEventListener('click', testUnsavedProxy);
+  $$('[data-proxy-action]', content()).forEach((button) => {
+    button.addEventListener('click', () => proxyRowAction(button));
+  });
+}
+
+async function addProxiesFromText() {
+  const text = $('#proxy-bulk').value.trim();
+  if (!text) {
+    toast('先填入至少一个代理', 'err');
+    return;
+  }
+  try {
+    const result = await api('/proxies/bulk', { method: 'POST', body: { text } });
+    const failed = (result.failures || []).length;
+    toast(`已添加 ${result.added} 个，跳过 ${result.skipped} 个${failed ? `，失败 ${failed} 个` : ''}`, failed ? 'err' : 'ok');
+    if (failed) console.warn('proxy add failures', result.failures);
+    await pageProxies();
+  } catch (error) {
+    toast(error.message, 'err');
+  }
+}
+
+async function testUnsavedProxy() {
+  const url = $('#proxy-test-input').value.trim();
+  if (!url) {
+    toast('填入代理地址再测试', 'err');
+    return;
+  }
+  const button = $('#proxy-test-unsaved');
+  button.disabled = true;
+  button.textContent = '测试中…';
+  try {
+    const data = await api('/proxies/test', { method: 'POST', body: { url } });
+    const result = data.result || {};
+    $('#proxy-test-result').textContent = result.healthy
+      ? `通过 · ${result.latency_ms}ms · 出口 IP ${result.exit_ip || '—'}`
+      : `失败 · ${result.error || 'unknown'}`;
+    toast(result.healthy ? '代理可用' : '代理不可用', result.healthy ? 'ok' : 'err');
+  } catch (error) {
+    toast(error.message, 'err');
+  } finally {
+    if (button.isConnected) {
+      button.disabled = false;
+      button.textContent = '测试';
+    }
+  }
+}
+
+async function proxyRowAction(button) {
+  const id = Number(button.dataset.id);
+  const action = button.dataset.proxyAction;
+  try {
+    if (action === 'delete') {
+      const ok = await confirmDialog('删除代理', `确认删除代理 #${id}？绑定它的账号会自动改为「跟随代理池」。`, '删除');
+      if (!ok) return;
+      await api(`/proxies/${id}`, { method: 'DELETE' });
+      toast('代理已删除');
+    } else if (action === 'test') {
+      const original = button.textContent;
+      button.disabled = true;
+      button.textContent = '测试中…';
+      const data = await api(`/proxies/${id}/test`, { method: 'POST', body: {} });
+      const result = data.result || {};
+      toast(
+        result.healthy
+          ? `代理 #${id} 可用 · ${result.latency_ms}ms · ${result.exit_ip || '—'}`
+          : `代理 #${id} 不可用：${result.error || 'unknown'}`,
+        result.healthy ? 'ok' : 'err',
+      );
+      button.disabled = false;
+      button.textContent = original;
+    } else {
+      await api(`/proxies/${id}/${action}`, { method: 'POST', body: {} });
+      toast(action === 'enable' ? '代理已启用' : '代理已停用');
+    }
+    await pageProxies();
+  } catch (error) {
+    toast(error.message, 'err');
+  }
+}
+
+async function testAllProxies(button) {
+  const original = button.textContent;
+  button.disabled = true;
+  let ok = 0;
+  let failed = 0;
+  try {
+    const targets = state.proxies.filter((proxy) => proxy.enabled);
+    for (let i = 0; i < targets.length; i += 1) {
+      button.textContent = `测试中 ${i + 1}/${targets.length}…`;
+      try {
+        const data = await api(`/proxies/${targets[i].id}/test`, { method: 'POST', body: {} });
+        if ((data.result || {}).healthy) ok += 1;
+        else failed += 1;
+      } catch {
+        failed += 1;
+      }
+    }
+    toast(`测试完成：${ok} 个可用 / ${failed} 个失败`, failed ? 'err' : 'ok');
+    await pageProxies();
   } finally {
     if (button.isConnected) {
       button.disabled = false;

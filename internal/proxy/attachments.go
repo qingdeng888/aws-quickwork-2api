@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"quickwork-openai/internal/netproxy"
 )
 
 // The upstream user_message frame is capped at 64 KB. A caller prompt that
@@ -40,7 +42,11 @@ func attachErr(format string, args ...any) error {
 	return &attachmentError{err: fmt.Errorf(format, args...)}
 }
 
-var attachmentHTTPClient = &http.Client{Timeout: 2 * time.Minute}
+// attachmentClient uses the proxy bound to ctx (see internal/netproxy), so
+// attachment traffic follows the account's proxy selection.
+func attachmentClient(ctx context.Context) *http.Client {
+	return netproxy.NewClient(ctx, 2*time.Minute)
+}
 
 // attachmentRef is the metadata referenced from user_message.payload.attachments.
 type attachmentRef struct {
@@ -118,7 +124,7 @@ func uploadPromptAttachment(ctx context.Context, sess *Session, threadID, name s
 	}
 	setAttachmentHeaders(req, token)
 	req.Header.Set("Content-Type", "application/octet-stream")
-	resp, err := attachmentHTTPClient.Do(req)
+	resp, err := attachmentClient(ctx).Do(req)
 	if err != nil {
 		return ref, attachErr("attachment upload: %v", err)
 	}
@@ -180,7 +186,7 @@ func waitAttachmentDLP(ctx context.Context, base, token, attachmentID string) er
 			return attachErr("attachment DLP request: %v", err)
 		}
 		setAttachmentHeaders(req, token)
-		resp, err := attachmentHTTPClient.Do(req)
+		resp, err := attachmentClient(ctx).Do(req)
 		if err != nil {
 			return attachErr("attachment DLP: %v", err)
 		}
@@ -243,7 +249,7 @@ func deliverAttachment(ctx context.Context, base, token, threadID, attachmentID 
 	}
 	setAttachmentHeaders(req, token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := attachmentHTTPClient.Do(req)
+	resp, err := attachmentClient(ctx).Do(req)
 	if err != nil {
 		return "", attachErr("attachment deliver: %v", err)
 	}

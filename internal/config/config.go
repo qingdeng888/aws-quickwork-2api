@@ -62,29 +62,39 @@ type WebUI struct {
 	TrustProxy   bool     `json:"trust_proxy"`
 }
 
+// ProxyPool configures the shared outbound proxy pool. Accounts set to
+// "follow the pool" rotate through its enabled proxies; a disabled pool makes
+// them connect directly.
+type ProxyPool struct {
+	Enabled       bool     `json:"enabled"`
+	TestURL       string   `json:"test_url"`
+	CheckInterval Duration `json:"check_interval"`
+}
+
 // Config is the server configuration stored in config.json.
 type Config struct {
-	Addr             string   `json:"addr"`
-	Database         string   `json:"database"`
-	APIKeys          []string `json:"api_keys"`
-	Models           []string `json:"models"`
-	DefaultModel     string   `json:"default_model"`
-	RequestTimeout   Duration `json:"request_timeout"`
-	RefreshBefore    Duration `json:"refresh_before"`
-	MaxAttempts      int      `json:"max_attempts"`
-	AppVersion       string   `json:"app_version"`
-	Surface          string   `json:"surface"`
-	OutpostID        string   `json:"outpost_id"`
-	WorkingSessionID string   `json:"working_session_id"`
-	Timezone         string   `json:"timezone"`
-	Locale           string   `json:"locale"`
-	ThinkingEffort   string   `json:"thinking_effort"`
-	ChatAgentID      string   `json:"chat_agent_id"`
-	KeepSessions     bool     `json:"keep_sessions"`
-	SessionReuse     bool     `json:"session_reuse"`
-	SessionTTL       Duration `json:"session_ttl"`
-	OAuth            OAuth    `json:"oauth"`
-	WebUI            *WebUI   `json:"webui,omitempty"`
+	Addr             string     `json:"addr"`
+	Database         string     `json:"database"`
+	APIKeys          []string   `json:"api_keys"`
+	Models           []string   `json:"models"`
+	DefaultModel     string     `json:"default_model"`
+	RequestTimeout   Duration   `json:"request_timeout"`
+	RefreshBefore    Duration   `json:"refresh_before"`
+	MaxAttempts      int        `json:"max_attempts"`
+	AppVersion       string     `json:"app_version"`
+	Surface          string     `json:"surface"`
+	OutpostID        string     `json:"outpost_id"`
+	WorkingSessionID string     `json:"working_session_id"`
+	Timezone         string     `json:"timezone"`
+	Locale           string     `json:"locale"`
+	ThinkingEffort   string     `json:"thinking_effort"`
+	ChatAgentID      string     `json:"chat_agent_id"`
+	KeepSessions     bool       `json:"keep_sessions"`
+	SessionReuse     bool       `json:"session_reuse"`
+	SessionTTL       Duration   `json:"session_ttl"`
+	OAuth            OAuth      `json:"oauth"`
+	WebUI            *WebUI     `json:"webui,omitempty"`
+	ProxyPool        *ProxyPool `json:"proxy_pool,omitempty"`
 
 	// Path is the absolute config file path; not serialized.
 	Path string `json:"-"`
@@ -114,6 +124,11 @@ func Default() Config {
 			BuildStage:   "prod",
 			CallbackPort: 18080,
 			Timeout:      Duration(time.Hour),
+		},
+		ProxyPool: &ProxyPool{
+			Enabled:       true,
+			TestURL:       "https://api.ipify.org?format=json",
+			CheckInterval: Duration(10 * time.Minute),
 		},
 		WebUI: &WebUI{
 			Enabled:     true,
@@ -208,6 +223,16 @@ func applyDefaults(c *Config) {
 	}
 	if strings.TrimSpace(c.Locale) == "" {
 		c.Locale = d.Locale
+	}
+	if c.ProxyPool == nil {
+		c.ProxyPool = d.ProxyPool
+	} else {
+		if strings.TrimSpace(c.ProxyPool.TestURL) == "" {
+			c.ProxyPool.TestURL = d.ProxyPool.TestURL
+		}
+		if c.ProxyPool.CheckInterval <= 0 {
+			c.ProxyPool.CheckInterval = d.ProxyPool.CheckInterval
+		}
 	}
 	if strings.TrimSpace(c.OAuth.Provider) == "" {
 		c.OAuth.Provider = d.OAuth.Provider

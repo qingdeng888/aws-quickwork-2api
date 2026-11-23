@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 
 	"quickwork-openai/internal/config"
@@ -20,6 +21,8 @@ type Session struct {
 	Surface          string
 	OutpostID        string
 	WorkingSessionID string
+	// Proxy is the outbound proxy for this account; nil connects directly.
+	Proxy *url.URL
 }
 
 func (s *Session) jwt() string {

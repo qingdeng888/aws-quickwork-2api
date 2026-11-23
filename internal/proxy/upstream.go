@@ -116,6 +116,9 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 
 	dialer := *websocket.DefaultDialer
 	dialer.HandshakeTimeout = 20 * time.Second
+	if sess.Proxy != nil {
+		dialer.Proxy = http.ProxyURL(sess.Proxy)
+	}
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
 	if err != nil {
 		detail := ""

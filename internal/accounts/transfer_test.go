@@ -195,3 +195,87 @@ func TestImportValidation(t *testing.T) {
 		t.Fatal("future version must be rejected")
 	}
 }
+
+func TestExportImportKeepsProxyBinding(t *testing.T) {
+	ctx := context.Background()
+	source := testStore(t)
+	active, parked := seedAccounts(t, source)
+	proxy, err := source.CreateProxy(ctx, "http://127.0.0.1:18080", "")
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	if err := source.SetAccountProxy(ctx, active.ID, proxy.ID); err != nil {
+		t.Fatalf("bind active: %v", err)
+	}
+	if err := source.SetAccountProxy(ctx, parked.ID, -1); err != nil {
+		t.Fatalf("bind parked direct: %v", err)
+	}
+
+	exported, err := Export(ctx, source, true)
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	var activeEntry, parkedEntry *TransferAccount
+	for i := range exported.File.Accounts {
+		switch exported.File.Accounts[i].Email {
+		case active.Email:
+			activeEntry = &exported.File.Accounts[i]
+		case parked.Email:
+			parkedEntry = &exported.File.Accounts[i]
+		}
+	}
+	if activeEntry == nil || activeEntry.ProxyURL != "http://127.0.0.1:18080" {
+		t.Fatalf("proxy_url not exported: %+v", activeEntry)
+	}
+	if parkedEntry == nil || !parkedEntry.Direct {
+		t.Fatalf("direct binding not exported: %+v", parkedEntry)
+	}
+
+	// The target installation gets the same proxy under a different id.
+	target := testStore(t)
+	first, _ := target.CreateProxy(ctx, "http://other:8080", "")
+	targetProxy, err := target.CreateProxy(ctx, "http://127.0.0.1:18080", "")
+	if err != nil {
+		t.Fatalf("target proxy: %v", err)
+	}
+	if first.ID == targetProxy.ID {
+		t.Fatal("test setup expects different ids")
+	}
+	res, err := Import(ctx, target, exported.File, false)
+	if err != nil || res.Imported != 2 {
+		t.Fatalf("import: %+v err=%v", res, err)
+	}
+	list, _ := target.List(ctx)
+	for i := range list {
+		switch list[i].Email {
+		case active.Email:
+			if list[i].ProxyID != targetProxy.ID {
+				t.Fatalf("active proxy_id = %d, want %d", list[i].ProxyID, targetProxy.ID)
+			}
+		case parked.Email:
+			if list[i].ProxyID != -1 {
+				t.Fatalf("parked proxy_id = %d, want -1", list[i].ProxyID)
+			}
+		}
+	}
+
+	// Updating tokens without proxy information keeps the local binding.
+	update := &TransferFile{Version: TransferVersion, Accounts: []TransferAccount{{
+		Email: active.Email, TenantURL: active.TenantURL, RefreshToken: "rotated",
+	}}}
+	if _, err := Import(ctx, target, update, true); err != nil {
+		t.Fatalf("update import: %v", err)
+	}
+	got, _ := target.Get(ctx, active.ID)
+	var stored *store.Account
+	list, _ = target.List(ctx)
+	for i := range list {
+		if list[i].Email == active.Email {
+			stored = &list[i]
+		}
+	}
+	if stored == nil || stored.ProxyID != targetProxy.ID {
+		t.Fatalf("update import changed the binding: %+v", stored)
+	}
+	_ = got
+}

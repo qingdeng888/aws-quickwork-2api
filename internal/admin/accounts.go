@@ -20,9 +20,12 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	refreshBefore := s.cfg.RefreshBefore.Duration()
+	labels := s.proxyLabelMap(r.Context())
 	views := make([]accountView, 0, len(lists))
 	for i := range lists {
-		views = append(views, viewAccount(&lists[i], refreshBefore))
+		view := viewAccount(&lists[i], refreshBefore)
+		view.ProxyLabel = labels[view.ProxyID]
+		views = append(views, view)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": views, "total": len(views)})
 }
@@ -140,10 +143,12 @@ func (s *Server) handleAccountState(w http.ResponseWriter, r *http.Request) {
 		state = "disabled"
 	}
 	s.logger.Printf("account %d (%s) %s", id, accountLabel(account), state)
+	view := viewAccount(account, s.cfg.RefreshBefore.Duration())
+	view.ProxyLabel = s.proxyLabelMap(r.Context())[view.ProxyID]
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":       id,
 		"disabled": disabled,
-		"account":  viewAccount(account, s.cfg.RefreshBefore.Duration()),
+		"account":  view,
 	})
 }
 
