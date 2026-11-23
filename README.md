@@ -300,10 +300,10 @@ docker compose up -d
 |---|---|
 | `Dockerfile` | 多阶段构建，最终 `alpine` 镜像以 uid 10001 非 root 运行 |
 | `docker/entrypoint.sh` | 启动前 `quickproxy config -from-env`，把环境变量渲染进 `config.json` |
-| `docker-compose.yml` | 默认 `image: ghcr.io/qingdeng888/aws-quickwork-2api:latest`，挂载 `./data`，带 healthcheck |
+| `docker-compose.yml` | dev 分支默认 `image: ghcr.io/qingdeng888/aws-quickwork-2api:latest-dev`（main 分支为 `:latest`），挂载 `./data`，带 healthcheck |
 | `docker-compose.build.yml` | 叠加使用即改为本地构建：`docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build` |
 | `.env.example` | 端口、管理密码、API key、OAuth 与模型等变量模板 |
-| `.github/workflows/docker.yml` | push `main` / 打 `v*` tag 构建 amd64+arm64 推到 GHCR，并对 amd64 镜像做冒烟测试 |
+| `.github/workflows/docker.yml` | push `main` / 打 `v*` tag 构建 amd64+arm64 推到 GHCR；push `dev` 构建带 `-dev` 后缀的镜像（`latest-dev`、`sha-xxxx-dev`），并对 amd64 镜像做冒烟测试 |
 
 - 所有持久化数据都在 `./data`：`config.json` + `quickwork.db`。入口脚本会以 root 修正该目录属主后立刻降权到 uid 10001，正常部署不需要手动 `chown`；只有显式配置了 `user:` 时才需要预先授权。
 - `.env` 的变量每次启动都会合并进 `config.json`（空值不覆盖）；`CONFIG_FROM_ENV=false` 可关闭。`WEBUI_PASSWORD` 只以 PBKDF2 哈希写盘，文件里已有 `password_hash` 时默认不覆盖，`WEBUI_PASSWORD_FORCE=1` 可强制以 env 为准。

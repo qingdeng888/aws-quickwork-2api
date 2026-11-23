@@ -14,7 +14,8 @@
 
 services:
   quickproxy:
-    image: ${IMAGE:-ghcr.io/qingdeng888/aws-quickwork-2api:latest}
+    # dev 分支默认跟进 dev 镜像（-dev 后缀）；main 分支默认是 :latest。
+    image: ${IMAGE:-ghcr.io/qingdeng888/aws-quickwork-2api:latest-dev}
     container_name: ${CONTAINER_NAME:-quickproxy}
     restart: unless-stopped
     env_file:
