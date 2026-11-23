@@ -92,6 +92,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/api/proxies", s.auth(s.handleListProxies))
 	mux.HandleFunc("POST /admin/api/proxies", s.auth(s.csrf(s.handleCreateProxy)))
 	mux.HandleFunc("POST /admin/api/proxies/bulk", s.auth(s.csrf(s.handleBulkCreateProxies)))
+	mux.HandleFunc("POST /admin/api/proxies/actions", s.auth(s.csrf(s.handleProxyBulkActions)))
 	mux.HandleFunc("POST /admin/api/proxies/test", s.auth(s.csrf(s.handleTestProxyValue)))
 	mux.HandleFunc("POST /admin/api/proxies/{id}/test", s.auth(s.csrf(s.handleTestProxy)))
 	mux.HandleFunc("POST /admin/api/proxies/{id}/{action}", s.auth(s.csrf(s.handleProxyState)))

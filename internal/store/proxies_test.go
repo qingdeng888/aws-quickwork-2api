@@ -80,12 +80,12 @@ func TestAccountProxyBinding(t *testing.T) {
 		t.Fatalf("save account: %v", err)
 	}
 
-	if err := st.SetAccountProxy(ctx, account.ID, proxy.ID); err != nil {
+	if err := st.SetAccountBinding(ctx, account.ID, ProxyModeBind, proxy.ID); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 	got, err := st.Get(ctx, account.ID)
-	if err != nil || got.ProxyID != proxy.ID {
-		t.Fatalf("proxy_id = %d, err=%v", got.ProxyID, err)
+	if err != nil || got.ProxyID != proxy.ID || got.ProxyMode != ProxyModeBind {
+		t.Fatalf("binding = %s/%d, err=%v", got.ProxyMode, got.ProxyID, err)
 	}
 
 	// Deleting the proxy must put the account back on the pool (0).
@@ -93,16 +93,16 @@ func TestAccountProxyBinding(t *testing.T) {
 		t.Fatalf("delete proxy: %v", err)
 	}
 	got, err = st.Get(ctx, account.ID)
-	if err != nil || got.ProxyID != 0 {
-		t.Fatalf("after delete proxy_id = %d, err=%v", got.ProxyID, err)
+	if err != nil || got.ProxyID != 0 || got.ProxyMode != ProxyModeAuto {
+		t.Fatalf("after delete = %s/%d, err=%v", got.ProxyMode, got.ProxyID, err)
 	}
 
-	if err := st.SetAccountProxy(ctx, account.ID, 999); err == nil {
+	if err := st.SetAccountBinding(ctx, account.ID, ProxyModeBind, 999); err == nil {
 		t.Fatal("binding a missing proxy must fail")
 	}
 
 	// Re-saving the account (e.g. re-login) must keep the binding.
-	if err := st.SetAccountProxy(ctx, account.ID, -1); err != nil {
+	if err := st.SetAccountBinding(ctx, account.ID, ProxyModeDirect, 0); err != nil {
 		t.Fatalf("direct: %v", err)
 	}
 	account.ProxyID = 0
@@ -110,7 +110,7 @@ func TestAccountProxyBinding(t *testing.T) {
 		t.Fatalf("re-save: %v", err)
 	}
 	got, _ = st.Get(ctx, account.ID)
-	if got.ProxyID != -1 {
-		t.Fatalf("re-save reset the binding to %d", got.ProxyID)
+	if got.ProxyMode != ProxyModeDirect || got.ProxyID != 0 {
+		t.Fatalf("re-save reset the binding to %s/%d", got.ProxyMode, got.ProxyID)
 	}
 }

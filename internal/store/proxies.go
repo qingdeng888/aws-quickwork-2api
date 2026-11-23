@@ -117,7 +117,8 @@ func (s *Store) DeleteProxy(ctx context.Context, id int64) (bool, error) {
 		return false, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `UPDATE accounts SET proxy_id=0 WHERE proxy_id=?`, id); err != nil {
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE accounts SET proxy_mode='auto', proxy_id=0 WHERE proxy_id=?`, id); err != nil {
 		return false, err
 	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM proxies WHERE id=?`, id)
@@ -144,20 +145,37 @@ WHERE id=?`, value, latencyMS, truncate(exitIP, 64), truncate(lastError, 300), n
 	return err
 }
 
-// SetAccountProxy binds an account to one proxy. proxyID 0 means "follow the
-// pool" and -1 means "always connect directly".
-func (s *Store) SetAccountProxy(ctx context.Context, accountID, proxyID int64) error {
-	if proxyID > 0 {
+// Account proxy binding modes, mirroring the web UI.
+const (
+	ProxyModeDirect = "direct"
+	ProxyModeAuto   = "auto"
+	ProxyModeRotate = "rotate"
+	ProxyModeBind   = "bind"
+)
+
+// SetAccountBinding selects how an account reaches the network: direct, auto
+// (sticky pool proxy with failover), rotate (a fresh proxy per request) or bind
+// (pinned to proxyID).
+func (s *Store) SetAccountBinding(ctx context.Context, accountID int64, mode string, proxyID int64) error {
+	switch mode {
+	case ProxyModeDirect, ProxyModeAuto, ProxyModeRotate:
+		proxyID = 0
+	case ProxyModeBind:
+		if proxyID <= 0 {
+			return fmt.Errorf("bind mode requires a proxy id")
+		}
 		if _, err := s.GetProxy(ctx, proxyID); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("proxy %d not found", proxyID)
 			}
 			return err
 		}
+	default:
+		return fmt.Errorf("unknown proxy mode %q (use direct, auto, rotate or bind)", mode)
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE accounts SET proxy_id=?, updated_at=? WHERE id=?`,
-		proxyID, time.Now().Unix(), accountID)
+		`UPDATE accounts SET proxy_mode=?, proxy_id=?, updated_at=? WHERE id=?`,
+		mode, proxyID, time.Now().Unix(), accountID)
 	if err != nil {
 		return err
 	}

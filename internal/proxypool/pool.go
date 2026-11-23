@@ -42,17 +42,31 @@ func New(st *store.Store) *Pool {
 }
 
 // Resolve returns the proxy URL for one account. A nil URL means a direct
-// connection. Accounts with ProxyID 0 follow the pool when poolEnabled is true
-// and no proxy is healthy; the pool rotates round-robin, preferring proxies
-// whose last health check passed so a dead entry does not take traffic.
+// connection. The account's ProxyMode decides the route:
+//
+//   - direct: never use a proxy
+//   - bind:   always the proxy stored in ProxyID (an error when it is gone or
+//     disabled, rather than silently changing the exit)
+//   - auto:   a sticky proxy picked by account id, with failover to a healthy
+//     one, so reconnects keep the same exit while a dead exit is avoided
+//   - rotate: a fresh healthy proxy per request, round-robin
+//
+// auto and rotate need proxy_pool.enabled; bind and direct do not.
 func (p *Pool) Resolve(ctx context.Context, account *store.Account, poolEnabled bool) (*url.URL, error) {
 	if account == nil {
 		return nil, nil
 	}
-	switch {
-	case account.ProxyID < 0:
+	mode := strings.TrimSpace(account.ProxyMode)
+	if mode == "" {
+		mode = store.ProxyModeAuto
+	}
+	switch mode {
+	case store.ProxyModeDirect:
 		return nil, nil
-	case account.ProxyID > 0:
+	case store.ProxyModeBind:
+		if account.ProxyID <= 0 {
+			return nil, fmt.Errorf("account %d: bind mode without a proxy id", account.ID)
+		}
 		proxy, err := p.store.GetProxy(ctx, account.ProxyID)
 		if err != nil {
 			return nil, fmt.Errorf("account %d: proxy %d not found", account.ID, account.ProxyID)
@@ -61,29 +75,41 @@ func (p *Pool) Resolve(ctx context.Context, account *store.Account, poolEnabled 
 			return nil, fmt.Errorf("account %d: proxy %d (%s) is disabled", account.ID, proxy.ID, netproxy.Redact(proxy.URL))
 		}
 		return netproxy.Parse(proxy.URL)
-	}
-	if !poolEnabled {
-		return nil, nil
-	}
-	list, err := p.store.EnabledProxies(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if len(list) == 0 {
-		return nil, nil
-	}
-	healthy := make([]store.Proxy, 0, len(list))
-	for _, proxy := range list {
-		if proxy.Healthy {
-			healthy = append(healthy, proxy)
+	case store.ProxyModeAuto, store.ProxyModeRotate:
+		if !poolEnabled {
+			return nil, nil
 		}
+		list, err := p.store.EnabledProxies(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if len(list) == 0 {
+			return nil, nil
+		}
+		healthy := make([]store.Proxy, 0, len(list))
+		for _, proxy := range list {
+			if proxy.Healthy {
+				healthy = append(healthy, proxy)
+			}
+		}
+		var picked store.Proxy
+		if mode == store.ProxyModeRotate {
+			candidates := healthy
+			if len(candidates) == 0 {
+				candidates = list
+			}
+			index := (p.next.Add(1) - 1) % uint64(len(candidates))
+			picked = candidates[index]
+		} else {
+			picked = list[int(account.ID%int64(len(list)))]
+			if !picked.Healthy && len(healthy) > 0 {
+				picked = healthy[int(account.ID%int64(len(healthy)))]
+			}
+		}
+		return netproxy.Parse(picked.URL)
+	default:
+		return nil, fmt.Errorf("account %d: unknown proxy mode %q", account.ID, mode)
 	}
-	candidates := healthy
-	if len(candidates) == 0 {
-		candidates = list
-	}
-	index := (p.next.Add(1) - 1) % uint64(len(candidates))
-	return netproxy.Parse(candidates[index].URL)
 }
 
 // Rotate is Resolve for callers that want the pool pick without an account.

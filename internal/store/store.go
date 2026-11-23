@@ -52,8 +52,10 @@ type Account struct {
 	UpdatedAt  int64 `json:"updated_at"`
 	LastUsedAt int64 `json:"last_used_at"`
 	UseCount   int64 `json:"use_count"`
-	// ProxyID selects the outbound proxy: 0 follows the proxy pool, a positive
-	// id pins one proxy, and -1 forces a direct connection.
+	// ProxyMode selects the outbound route: "direct", "auto" (sticky proxy
+	// picked from the pool with failover), "rotate" (a fresh healthy proxy per
+	// request) or "bind" (pinned to ProxyID). ProxyID is only used by "bind".
+	ProxyMode string `json:"proxy_mode"`
 	ProxyID   int64  `json:"proxy_id"`
 	Disabled  bool   `json:"disabled"`
 	LastError string `json:"last_error"`
@@ -153,7 +155,8 @@ CREATE TABLE IF NOT EXISTS accounts (
 	use_count      INTEGER NOT NULL DEFAULT 0,
 	disabled       INTEGER NOT NULL DEFAULT 0,
 	last_error     TEXT NOT NULL DEFAULT '',
-	proxy_id       INTEGER NOT NULL DEFAULT 0
+	proxy_id       INTEGER NOT NULL DEFAULT 0,
+	proxy_mode     TEXT NOT NULL DEFAULT 'auto'
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email_tenant ON accounts(email, tenant_url);
 CREATE INDEX IF NOT EXISTS idx_accounts_enabled ON accounts(disabled, id);
@@ -177,7 +180,20 @@ CREATE INDEX IF NOT EXISTS idx_proxies_enabled ON proxies(enabled, id);
 	}
 	// Databases created before the proxy pool lack the column; add it in place
 	// so an upgrade keeps every account.
-	return s.ensureColumn("accounts", "proxy_id", "INTEGER NOT NULL DEFAULT 0")
+	if err := s.ensureColumn("accounts", "proxy_id", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("accounts", "proxy_mode", "TEXT NOT NULL DEFAULT 'auto'"); err != nil {
+		return err
+	}
+	// Rows created before proxy_mode existed used proxy_id -1 for direct, >0 for
+	// a pinned proxy and 0 for pool rotation.
+	_, err := s.db.Exec(`UPDATE accounts SET proxy_mode = CASE
+		WHEN proxy_id < 0 THEN 'direct'
+		WHEN proxy_id > 0 THEN 'bind'
+		ELSE 'rotate' END
+		WHERE proxy_mode = '' OR proxy_mode IS NULL`)
+	return err
 }
 
 // ensureColumn adds a column when an older database schema does not have it.
@@ -219,7 +235,7 @@ const columns = `id, email, display_name, provider, build_stage, region,
 	actor_arn, aws_account_id, account_name, client_id, client_secret,
 	issuer_url, idc_region, auth_endpoint, token_endpoint, redirect_uri,
 	user_info, expires_at, obtained_at, created_at, updated_at,
-	last_used_at, use_count, disabled, last_error, proxy_id`
+	last_used_at, use_count, disabled, last_error, proxy_id, proxy_mode`
 
 type scanner interface {
 	Scan(dest ...any) error
@@ -234,7 +250,7 @@ func scanAccount(row scanner) (*Account, error) {
 		&a.ActorARN, &a.AWSAccountID, &a.AccountName, &a.ClientID, &a.ClientSecret,
 		&a.IssuerURL, &a.IDCRegion, &a.AuthEndpoint, &a.TokenEndpoint, &a.RedirectURI,
 		&a.UserInfo, &a.ExpiresAt, &a.ObtainedAt, &a.CreatedAt, &a.UpdatedAt,
-		&a.LastUsedAt, &a.UseCount, &disabled, &a.LastError, &a.ProxyID,
+		&a.LastUsedAt, &a.UseCount, &disabled, &a.LastError, &a.ProxyID, &a.ProxyMode,
 	)
 	if err != nil {
 		return nil, err
@@ -251,6 +267,9 @@ func (s *Store) Save(ctx context.Context, a *Account) error {
 		a.CreatedAt = now
 	}
 	a.UpdatedAt = now
+	if strings.TrimSpace(a.ProxyMode) == "" {
+		a.ProxyMode = "auto"
+	}
 	var disabled int
 	if a.Disabled {
 		disabled = 1
@@ -261,8 +280,8 @@ INSERT INTO accounts (email, display_name, provider, build_stage, region,
 	actor_arn, aws_account_id, account_name, client_id, client_secret,
 	issuer_url, idc_region, auth_endpoint, token_endpoint, redirect_uri,
 	user_info, expires_at, obtained_at, created_at, updated_at,
-	last_used_at, use_count, disabled, last_error, proxy_id)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	last_used_at, use_count, disabled, last_error, proxy_id, proxy_mode)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(email, tenant_url) DO UPDATE SET
 	display_name=excluded.display_name,
 	provider=excluded.provider,
@@ -289,6 +308,7 @@ ON CONFLICT(email, tenant_url) DO UPDATE SET
 	updated_at=excluded.updated_at,
 	disabled=accounts.disabled,
 	proxy_id=accounts.proxy_id,
+	proxy_mode=accounts.proxy_mode,
 	last_error=''
 RETURNING id`
 	err := s.db.QueryRowContext(ctx, q,
@@ -297,7 +317,7 @@ RETURNING id`
 		a.ActorARN, a.AWSAccountID, a.AccountName, a.ClientID, a.ClientSecret,
 		a.IssuerURL, a.IDCRegion, a.AuthEndpoint, a.TokenEndpoint, a.RedirectURI,
 		a.UserInfo, a.ExpiresAt, a.ObtainedAt, a.CreatedAt, a.UpdatedAt,
-		a.LastUsedAt, a.UseCount, disabled, a.LastError, a.ProxyID,
+		a.LastUsedAt, a.UseCount, disabled, a.LastError, a.ProxyID, a.ProxyMode,
 	).Scan(&a.ID)
 	return err
 }

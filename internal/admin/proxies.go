@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"quickwork-openai/internal/netproxy"
@@ -269,8 +270,9 @@ func (s *Server) testURL() string {
 	return proxypool.DefaultTestURL
 }
 
-// handleAccountProxy binds one account to a proxy: 0 follows the pool, a
-// positive id pins a proxy and -1 forces a direct connection.
+// handleAccountProxy selects how one account reaches the network: direct, auto
+// (sticky pool proxy with failover), rotate (a fresh proxy per request) or bind
+// to a specific proxy.
 func (s *Server) handleAccountProxy(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
@@ -278,19 +280,16 @@ func (s *Server) handleAccountProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		ProxyID *int64 `json:"proxy_id"`
+		Mode    string `json:"mode"`
+		ProxyID int64  `json:"proxy_id"`
 	}
 	if err := decodeJSON(r, &input, 4<<10); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	if input.ProxyID == nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "proxy_id is required")
-		return
-	}
-	proxyID := *input.ProxyID
-	if proxyID < -1 {
-		writeError(w, http.StatusBadRequest, "invalid_request", "proxy_id must be -1 (direct), 0 (pool) or a proxy id")
+	mode := strings.ToLower(strings.TrimSpace(input.Mode))
+	if mode == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "mode is required (direct, auto, rotate or bind)")
 		return
 	}
 	account, err := s.store.Get(r.Context(), id)
@@ -298,17 +297,24 @@ func (s *Server) handleAccountProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "account not found")
 		return
 	}
-	if err := s.store.SetAccountProxy(r.Context(), id, proxyID); err != nil {
+	if err := s.store.SetAccountBinding(r.Context(), id, mode, input.ProxyID); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_proxy", err.Error())
 		return
 	}
-	account.ProxyID = proxyID
-	s.logger.Printf("account %d (%s) proxy_id=%d", id, accountLabel(account), proxyID)
+	account.ProxyMode = mode
+	account.ProxyID = input.ProxyID
+	if mode != store.ProxyModeBind {
+		account.ProxyID = 0
+	}
+	s.logger.Printf("account %d (%s) proxy_mode=%s proxy_id=%d", id, accountLabel(account), account.ProxyMode, account.ProxyID)
+	view := viewAccount(account, s.cfg.RefreshBefore.Duration())
+	view.ProxyLabel = s.proxyLabelMap(r.Context())[view.ProxyID]
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id":       id,
-		"proxy_id": proxyID,
-		"account":  viewAccount(account, s.cfg.RefreshBefore.Duration()),
-		"updated":  time.Now().Unix(),
+		"id":         id,
+		"proxy_mode": account.ProxyMode,
+		"proxy_id":   account.ProxyID,
+		"account":    view,
+		"updated":    time.Now().Unix(),
 	})
 }
 
@@ -327,4 +333,112 @@ func (s *Server) proxyLabelMap(ctx context.Context) map[int64]string {
 		out[proxy.ID] = label
 	}
 	return out
+}
+
+// handleProxyBulkActions runs one action over the proxies selected in the UI:
+// test, enable, disable or delete.
+func (s *Server) handleProxyBulkActions(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Action string  `json:"action"`
+		IDs    []int64 `json:"ids"`
+	}
+	if err := decodeJSON(r, &input, 64<<10); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	action := strings.ToLower(strings.TrimSpace(input.Action))
+	switch action {
+	case "test", "enable", "disable", "delete":
+	default:
+		writeError(w, http.StatusBadRequest, "invalid_request", "action must be test, enable, disable or delete")
+		return
+	}
+	ids := make([]int64, 0, len(input.IDs))
+	seen := make(map[int64]bool, len(input.IDs))
+	for _, id := range input.IDs {
+		if id > 0 && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "no proxy ids selected")
+		return
+	}
+
+	type item struct {
+		ID        int64  `json:"id"`
+		OK        bool   `json:"ok"`
+		Error     string `json:"error,omitempty"`
+		Healthy   *bool  `json:"healthy,omitempty"`
+		LatencyMS int    `json:"latency_ms,omitempty"`
+		ExitIP    string `json:"exit_ip,omitempty"`
+	}
+	results := make([]item, len(ids))
+	testURL := s.testURL()
+
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	for i, id := range ids {
+		wg.Add(1)
+		go func(index int, proxyID int64) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			entry := item{ID: proxyID}
+			switch action {
+			case "test":
+				proxy, err := s.store.GetProxy(r.Context(), proxyID)
+				if err != nil {
+					entry.Error = "proxy not found"
+					break
+				}
+				result, err := s.accounts.ProxyPool().CheckAndRecord(r.Context(), proxyID, proxy.URL, testURL)
+				if err != nil {
+					entry.Error = err.Error()
+					break
+				}
+				healthy := result.Healthy
+				entry.OK = true
+				entry.Healthy = &healthy
+				entry.LatencyMS = result.LatencyMS
+				entry.ExitIP = result.ExitIP
+				if result.Error != "" {
+					entry.Error = result.Error
+				}
+			case "enable", "disable":
+				found, err := s.store.SetProxyEnabled(r.Context(), proxyID, action == "enable")
+				entry.OK = found && err == nil
+				if err != nil {
+					entry.Error = err.Error()
+				} else if !found {
+					entry.Error = "proxy not found"
+				}
+			case "delete":
+				removed, err := s.store.DeleteProxy(r.Context(), proxyID)
+				entry.OK = removed && err == nil
+				if err != nil {
+					entry.Error = err.Error()
+				} else if !removed {
+					entry.Error = "proxy not found"
+				}
+			}
+			results[index] = entry
+		}(i, id)
+	}
+	wg.Wait()
+
+	okCount := 0
+	for _, entry := range results {
+		if entry.OK {
+			okCount++
+		}
+	}
+	s.logger.Printf("proxies bulk %s: %d selected, %d ok", action, len(ids), okCount)
+	s.writeProxyList(w, r, map[string]any{
+		"action":  action,
+		"results": results,
+		"ok":      okCount,
+		"failed":  len(ids) - okCount,
+	})
 }

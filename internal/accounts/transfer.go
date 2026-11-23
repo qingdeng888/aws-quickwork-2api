@@ -57,10 +57,12 @@ type TransferAccount struct {
 	ObtainedAt int64 `json:"obtained_at,omitempty"`
 	CreatedAt  int64 `json:"created_at,omitempty"`
 	Disabled   bool  `json:"disabled,omitempty"`
-	// ProxyURL mirrors the proxy binding as a URL, because proxy ids are local
-	// to one installation. Direct forces a direct connection (no pool).
-	ProxyURL string `json:"proxy_url,omitempty"`
-	Direct   bool   `json:"proxy_direct,omitempty"`
+	// ProxyMode is direct, auto, rotate or bind. ProxyURL mirrors a bind
+	// binding as a URL, because proxy ids are local to one installation.
+	ProxyMode string `json:"proxy_mode,omitempty"`
+	ProxyURL  string `json:"proxy_url,omitempty"`
+	// Direct is the pre-proxy_mode field, kept so old exports still import.
+	Direct bool `json:"proxy_direct,omitempty"`
 }
 
 // ExportResult is one export plus the counts the caller may want to show.
@@ -112,10 +114,19 @@ func Export(ctx context.Context, st *store.Store, includeSecrets bool) (*ExportR
 			CreatedAt:    account.CreatedAt,
 			Disabled:     account.Disabled,
 		}
-		switch {
-		case account.ProxyID < 0:
-			entry.Direct = true
-		case account.ProxyID > 0:
+		entry.ProxyMode = account.ProxyMode
+		if account.ProxyMode == "" {
+			switch {
+			case account.ProxyID < 0:
+				entry.Direct = true
+			case account.ProxyID > 0:
+				entry.ProxyMode = "bind"
+				entry.ProxyURL = proxyURLs[account.ProxyID]
+			default:
+				entry.ProxyMode = "rotate"
+			}
+		}
+		if entry.ProxyMode == "bind" {
 			entry.ProxyURL = proxyURLs[account.ProxyID]
 		}
 		if includeSecrets {
@@ -133,6 +144,40 @@ func Export(ctx context.Context, st *store.Store, includeSecrets bool) (*ExportR
 		file.Accounts = append(file.Accounts, entry)
 	}
 	return res, nil
+}
+
+// transferHasBinding reports whether an exported entry carries a binding at
+// all; entries without one keep the local binding on update.
+func transferHasBinding(entry TransferAccount) bool {
+	return strings.TrimSpace(entry.ProxyMode) != "" || entry.Direct ||
+		strings.TrimSpace(entry.ProxyURL) != ""
+}
+
+// importBinding maps an exported binding onto the target installation. A bind
+// whose proxy URL is absent there degrades to the pool instead of failing.
+func importBinding(entry TransferAccount, proxyIDs map[string]int64) (string, int64) {
+	mode := strings.TrimSpace(entry.ProxyMode)
+	if mode == "" {
+		switch {
+		case entry.Direct:
+			mode = "direct"
+		case strings.TrimSpace(entry.ProxyURL) != "":
+			mode = "bind"
+		default:
+			return "auto", 0
+		}
+	}
+	switch mode {
+	case "direct", "auto", "rotate":
+		return mode, 0
+	case "bind":
+		if id := proxyIDs[strings.TrimSpace(entry.ProxyURL)]; id > 0 {
+			return "bind", id
+		}
+		return "auto", 0
+	default:
+		return "auto", 0
+	}
 }
 
 // ImportResult summarises an incremental import.
@@ -225,14 +270,7 @@ func Import(ctx context.Context, st *store.Store, file *TransferFile, update boo
 			CreatedAt:     entry.CreatedAt,
 			Disabled:      entry.Disabled,
 		}
-		switch {
-		case entry.Direct:
-			account.ProxyID = -1
-		case strings.TrimSpace(entry.ProxyURL) != "":
-			// The target installation may have the same proxy under a new id;
-			// when it is absent the account follows the local pool instead.
-			account.ProxyID = proxyIDs[strings.TrimSpace(entry.ProxyURL)]
-		}
+		account.ProxyMode, account.ProxyID = importBinding(entry, proxyIDs)
 		if account.Provider == "" {
 			account.Provider = "social"
 		}
@@ -246,8 +284,10 @@ func Import(ctx context.Context, st *store.Store, file *TransferFile, update boo
 			account.CreatedAt = current.CreatedAt
 			account.UseCount = current.UseCount
 			account.LastUsedAt = current.LastUsedAt
-			if !entry.Direct && strings.TrimSpace(entry.ProxyURL) == "" {
-				account.ProxyID = current.ProxyID
+			if transferHasBinding(entry) {
+				account.ProxyMode, account.ProxyID = importBinding(entry, proxyIDs)
+			} else {
+				account.ProxyMode, account.ProxyID = current.ProxyMode, current.ProxyID
 			}
 			if err := st.Save(ctx, account); err != nil {
 				res.Errors = append(res.Errors, fmt.Sprintf("account %d (%s): %v", i+1, email, err))

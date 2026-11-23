@@ -456,11 +456,18 @@ function renderAccounts() {
   $$('[data-proxy-select]', content()).forEach((select) => {
     select.addEventListener('change', async () => {
       const id = Number(select.dataset.account);
-      const proxyID = Number(select.value);
+      const raw = select.value;
+      const mode = raw.startsWith('bind:') ? 'bind' : raw;
+      const proxyID = mode === 'bind' ? Number(raw.split(':')[1]) : 0;
       select.disabled = true;
       try {
-        await api(`/accounts/${id}/proxy`, { method: 'POST', body: { proxy_id: proxyID } });
-        toast(proxyID === -1 ? '账号改为直连' : proxyID === 0 ? '账号跟随代理池' : `账号已绑定代理 #${proxyID}`);
+        await api(`/accounts/${id}/proxy`, { method: 'POST', body: { mode, proxy_id: proxyID } });
+        const labels = {
+          direct: '账号改为直连',
+          auto: '账号改为自动绑定（固定出口 + 故障转移）',
+          rotate: '账号改为自动轮询（每次请求换出口）',
+        };
+        toast(labels[mode] || `账号已绑定代理 #${proxyID}`);
         await pageAccounts();
       } catch (error) {
         toast(error.message, 'err');
@@ -607,16 +614,19 @@ async function refreshAllAccounts(button) {
 }
 
 function proxyOptions(account) {
-  const current = String(account.proxy_id === undefined ? 0 : account.proxy_id);
+  const mode = account.proxy_mode || 'auto';
+  const current = mode === 'bind' ? `bind:${account.proxy_id}` : mode;
+  const selectable = (state.proxies || []).filter((proxy) => proxy.enabled || proxy.id === account.proxy_id);
   const options = [
-    { value: '-1', label: '直连（不走代理）' },
-    { value: '0', label: '跟随代理池' },
-  ].concat((state.proxies || []).map((proxy) => ({
-    value: String(proxy.id),
-    label: `#${proxy.id} ${proxy.label || proxy.url}${proxy.enabled ? '' : '（已停用）'}`,
+    { value: 'direct', label: '直连（不走代理）' },
+    { value: 'auto', label: '自动绑定（固定出口 + 故障转移）' },
+    { value: 'rotate', label: '自动轮询（每次请求换出口）' },
+  ].concat(selectable.map((proxy) => ({
+    value: `bind:${proxy.id}`,
+    label: `指定 #${proxy.id} ${proxy.label || proxy.url}${proxy.enabled ? '' : '（已停用）'}`,
   })));
   return options
-    .map((option) => `<option value="${option.value}" ${current === option.value ? 'selected' : ''}>${esc(option.label)}</option>`)
+    .map((option) => `<option value="${esc(option.value)}" ${current === option.value ? 'selected' : ''}>${esc(option.label)}</option>`)
     .join('');
 }
 
@@ -640,6 +650,7 @@ function proxyStatus(proxy) {
 function renderProxies(data) {
   const pool = data.pool || {};
   const rows = state.proxies.map((proxy) => `<tr>
+      <td><input type="checkbox" class="proxy-pick" data-id="${proxy.id}" aria-label="选择代理 ${proxy.id}" /></td>
       <td class="mono">${proxy.id}</td>
       <td>
         <div class="cell-main truncate" title="${esc(proxy.url)}">${esc(proxy.label || proxy.url)}</div>
@@ -663,8 +674,18 @@ function renderProxies(data) {
           <h2>代理池</h2>
           <span class="hint">${state.proxies.length} 个代理 · 代理池${pool.enabled ? '已启用' : '已停用（跟随池的账号按直连处理）'} · 测试地址 ${esc(pool.test_url || '')}</span>
         </div>
-        ${state.proxies.length ? `<div class="table-wrap"><table>
-          <thead><tr><th>ID</th><th>代理</th><th>状态</th><th>出口 IP</th><th>绑定账号</th><th>最近错误</th><th></th></tr></thead>
+        ${state.proxies.length ? `
+        <div class="bulk-bar" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+          <button class="btn ghost sm" type="button" id="proxy-select-all">全选</button>
+          <button class="btn ghost sm" type="button" id="proxy-clear-select">取消全选</button>
+          <button class="btn ghost sm" type="button" id="proxy-test-selected">⚡ 测试选中</button>
+          <button class="btn ghost sm" type="button" id="proxy-enable-selected">✅ 启用选中</button>
+          <button class="btn ghost sm" type="button" id="proxy-disable-selected">⏸ 停用选中</button>
+          <button class="btn danger sm" type="button" id="proxy-delete-selected">🗑 删除选中</button>
+          <span class="hint" id="proxy-selected-count" style="margin-left:auto">已选 0</span>
+        </div>
+        <div class="table-wrap"><table>
+          <thead><tr><th><input type="checkbox" id="proxy-select-all-box" aria-label="全选代理" /></th><th>ID</th><th>代理</th><th>状态</th><th>出口 IP</th><th>绑定账号</th><th>最近错误</th><th></th></tr></thead>
           <tbody>${rows}</tbody>
         </table></div>` : '<div class="empty">代理池还是空的<br /><span class="faint">支持 http / https / socks5，地址里可以带 user:pass</span></div>'}
       </div>
@@ -686,6 +707,86 @@ function renderProxies(data) {
   $$('[data-proxy-action]', content()).forEach((button) => {
     button.addEventListener('click', () => proxyRowAction(button));
   });
+
+  const boxes = $$('.proxy-pick', content());
+  boxes.forEach((box) => box.addEventListener('change', updateProxySelection));
+  const headerBox = $('#proxy-select-all-box');
+  if (headerBox) {
+    headerBox.addEventListener('change', () => {
+      boxes.forEach((box) => { box.checked = headerBox.checked; });
+      updateProxySelection();
+    });
+  }
+  const selectAll = () => {
+    boxes.forEach((box) => { box.checked = true; });
+    if (headerBox) headerBox.checked = true;
+    updateProxySelection();
+  };
+  const clearAll = () => {
+    boxes.forEach((box) => { box.checked = false; });
+    if (headerBox) headerBox.checked = false;
+    updateProxySelection();
+  };
+  $('#proxy-select-all').addEventListener('click', selectAll);
+  $('#proxy-clear-select').addEventListener('click', clearAll);
+  $('#proxy-test-selected').addEventListener('click', (event) => bulkProxyAction('test', event.currentTarget));
+  $('#proxy-enable-selected').addEventListener('click', (event) => bulkProxyAction('enable', event.currentTarget));
+  $('#proxy-disable-selected').addEventListener('click', (event) => bulkProxyAction('disable', event.currentTarget));
+  $('#proxy-delete-selected').addEventListener('click', (event) => bulkProxyAction('delete', event.currentTarget));
+  updateProxySelection();
+}
+
+function selectedProxyIDs() {
+  return $$('.proxy-pick', content())
+    .filter((box) => box.checked)
+    .map((box) => Number(box.dataset.id))
+    .filter((id) => id > 0);
+}
+
+function updateProxySelection() {
+  const count = selectedProxyIDs().length;
+  const label = $('#proxy-selected-count');
+  if (label) label.textContent = `已选 ${count}`;
+  const headerBox = $('#proxy-select-all-box');
+  const boxes = $$('.proxy-pick', content());
+  if (headerBox && boxes.length) {
+    headerBox.checked = count === boxes.length;
+    headerBox.indeterminate = count > 0 && count < boxes.length;
+  }
+}
+
+async function bulkProxyAction(action, button) {
+  const ids = selectedProxyIDs();
+  if (ids.length === 0) {
+    toast('先勾选要操作的代理', 'err');
+    return;
+  }
+  const labels = { test: '测试', enable: '启用', disable: '停用', delete: '删除' };
+  if (action === 'delete') {
+    const ok = await confirmDialog('删除选中的代理', `确认删除 ${ids.length} 个代理？绑定它们的账号会自动改为自动轮询。`, '删除');
+    if (!ok) return;
+  }
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = `${labels[action]}中…`;
+  try {
+    const data = await api('/proxies/actions', { method: 'POST', body: { action, ids } });
+    const failed = (data.results || []).filter((item) => !item.ok || item.error);
+    if (action === 'test') {
+      const healthy = (data.results || []).filter((item) => item.ok && item.healthy).length;
+      toast(`测试完成：${healthy} 个可用 / ${ids.length - healthy} 个异常`, healthy === ids.length ? 'ok' : 'err');
+      if (failed.length) console.warn('proxy test failures', failed);
+    } else {
+      toast(`${labels[action]}完成：${data.ok} 个成功${data.failed ? `，${data.failed} 个失败` : ''}`, data.failed ? 'err' : 'ok');
+    }
+    await pageProxies();
+  } catch (error) {
+    toast(error.message, 'err');
+    if (button.isConnected) {
+      button.disabled = false;
+      button.textContent = original;
+    }
+  }
 }
 
 async function addProxiesFromText() {

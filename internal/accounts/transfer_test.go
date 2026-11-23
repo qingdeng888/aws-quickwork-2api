@@ -204,10 +204,10 @@ func TestExportImportKeepsProxyBinding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create proxy: %v", err)
 	}
-	if err := source.SetAccountProxy(ctx, active.ID, proxy.ID); err != nil {
+	if err := source.SetAccountBinding(ctx, active.ID, store.ProxyModeBind, proxy.ID); err != nil {
 		t.Fatalf("bind active: %v", err)
 	}
-	if err := source.SetAccountProxy(ctx, parked.ID, -1); err != nil {
+	if err := source.SetAccountBinding(ctx, parked.ID, store.ProxyModeDirect, 0); err != nil {
 		t.Fatalf("bind parked direct: %v", err)
 	}
 
@@ -224,10 +224,10 @@ func TestExportImportKeepsProxyBinding(t *testing.T) {
 			parkedEntry = &exported.File.Accounts[i]
 		}
 	}
-	if activeEntry == nil || activeEntry.ProxyURL != "http://127.0.0.1:18080" {
-		t.Fatalf("proxy_url not exported: %+v", activeEntry)
+	if activeEntry == nil || activeEntry.ProxyMode != store.ProxyModeBind || activeEntry.ProxyURL != "http://127.0.0.1:18080" {
+		t.Fatalf("bind binding not exported: %+v", activeEntry)
 	}
-	if parkedEntry == nil || !parkedEntry.Direct {
+	if parkedEntry == nil || parkedEntry.ProxyMode != store.ProxyModeDirect {
 		t.Fatalf("direct binding not exported: %+v", parkedEntry)
 	}
 
@@ -249,12 +249,12 @@ func TestExportImportKeepsProxyBinding(t *testing.T) {
 	for i := range list {
 		switch list[i].Email {
 		case active.Email:
-			if list[i].ProxyID != targetProxy.ID {
-				t.Fatalf("active proxy_id = %d, want %d", list[i].ProxyID, targetProxy.ID)
+			if list[i].ProxyMode != store.ProxyModeBind || list[i].ProxyID != targetProxy.ID {
+				t.Fatalf("active binding = %s/%d, want bind/%d", list[i].ProxyMode, list[i].ProxyID, targetProxy.ID)
 			}
 		case parked.Email:
-			if list[i].ProxyID != -1 {
-				t.Fatalf("parked proxy_id = %d, want -1", list[i].ProxyID)
+			if list[i].ProxyMode != store.ProxyModeDirect {
+				t.Fatalf("parked mode = %s, want direct", list[i].ProxyMode)
 			}
 		}
 	}
@@ -274,7 +274,7 @@ func TestExportImportKeepsProxyBinding(t *testing.T) {
 			stored = &list[i]
 		}
 	}
-	if stored == nil || stored.ProxyID != targetProxy.ID {
+	if stored == nil || stored.ProxyMode != store.ProxyModeBind || stored.ProxyID != targetProxy.ID {
 		t.Fatalf("update import changed the binding: %+v", stored)
 	}
 	_ = got
