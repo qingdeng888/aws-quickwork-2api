@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"quickwork-openai/internal/accounts"
@@ -21,7 +22,7 @@ import (
 type Server struct {
 	cfg      *config.Config
 	accounts *accounts.Manager
-	tokens   *APIKeyAuth
+	tokens   atomic.Pointer[APIKeyAuth]
 	upstream *Upstream
 	sessions *conversationStore
 	records  chatRecorder
@@ -33,13 +34,29 @@ type Server struct {
 }
 
 func NewServer(cfg *config.Config, mgr *accounts.Manager) *Server {
-	return &Server{
+	s := &Server{
 		cfg:      cfg,
 		accounts: mgr,
-		tokens:   NewAPIKeyAuth(cfg.APIKeys),
 		upstream: NewUpstream(cfg),
 		sessions: newConversationStore(cfg.SessionTTL.Duration(), 256),
 	}
+	s.tokens.Store(NewAPIKeyAuth(cfg.APIKeys))
+	return s
+}
+
+// SetAPIKeys replaces the accepted /v1 credentials without a restart.
+func (s *Server) SetAPIKeys(keys []string) {
+	s.tokens.Store(NewAPIKeyAuth(keys))
+}
+
+// APIKeys returns the accepted /v1 credentials.
+func (s *Server) APIKeys() []string {
+	return s.tokens.Load().Keys()
+}
+
+// APIKeyCount reports how many /v1 credentials are configured.
+func (s *Server) APIKeyCount() int {
+	return s.tokens.Load().Count()
 }
 
 func (s *Server) Handler() http.Handler {
@@ -111,7 +128,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "GET required")
 		return
 	}
-	if !s.tokens.Allowed(r) {
+	if !s.tokens.Load().Allowed(r) {
 		writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "invalid proxy API key")
 		return
 	}
@@ -133,7 +150,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST required")
 		return
 	}
-	if !s.tokens.Allowed(r) && !adminAuthenticated(r) {
+	if !s.tokens.Load().Allowed(r) && !adminAuthenticated(r) {
 		writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "invalid proxy API key")
 		return
 	}

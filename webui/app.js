@@ -24,10 +24,11 @@ const PAGES = {
   overview: { title: '总览', eyebrow: 'SECTION 01 / RUNTIME', load: pageOverview },
   accounts: { title: '账号', eyebrow: 'SECTION 02 / ACCOUNTS', load: pageAccounts },
   proxies: { title: '代理池', eyebrow: 'SECTION 03 / PROXY POOL', load: pageProxies },
-  login: { title: '登录上游', eyebrow: 'SECTION 04 / OAUTH', load: pageLogin },
-  config: { title: '配置', eyebrow: 'SECTION 04 / CONFIG', load: pageConfig },
-  logs: { title: '请求日志', eyebrow: 'SECTION 05 / TRAFFIC', load: pageLogs },
-  playground: { title: 'Playground', eyebrow: 'SECTION 06 / CHAT', load: pagePlayground },
+  apikeys: { title: 'API Key', eyebrow: 'SECTION 04 / ACCESS KEYS', load: pageAPIKeys },
+  login: { title: '登录上游', eyebrow: 'SECTION 05 / OAUTH', load: pageLogin },
+  config: { title: '配置', eyebrow: 'SECTION 06 / CONFIG', load: pageConfig },
+  logs: { title: '请求日志', eyebrow: 'SECTION 07 / TRAFFIC', load: pageLogs },
+  playground: { title: 'Playground', eyebrow: 'SECTION 08 / CHAT', load: pagePlayground },
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -895,6 +896,100 @@ async function testAllProxies(button) {
       button.disabled = false;
       button.textContent = original;
     }
+  }
+}
+
+/* ---------- API keys ---------- */
+
+async function pageAPIKeys() {
+  setTopActions([
+    { label: '新增 Key', cls: 'primary', onClick: () => $('#apikey-input') && $('#apikey-input').focus() },
+  ]);
+  const data = await api('/apikeys');
+  renderAPIKeys(data);
+}
+
+function renderAPIKeys(data) {
+  const keys = data.keys || [];
+  state.apikeyCount = keys.length;
+  const rows = keys.map((key, index) => `<tr>
+      <td class="mono">${index + 1}</td>
+      <td class="mono truncate" title="${esc(key)}">${esc(key)}</td>
+      <td class="actions">
+        <button class="btn ghost sm" type="button" data-copy="${esc(key)}">复制</button>
+        <button class="btn danger sm" type="button" data-action="delete-key" data-key="${esc(key)}">删除</button>
+      </td>
+    </tr>`).join('');
+
+  content().innerHTML = `
+    <div class="page">
+      ${keys.length ? '' : `<div class="banner warn" style="margin-bottom:14px">当前没有 API Key，<code>/v1</code> 处于<strong>不鉴权</strong>状态：任何能访问这个端口的人都可以调用。建议至少添加一个。</div>`}
+      <div class="card">
+        <div class="card-head">
+          <h2>访问密钥</h2>
+          <span class="hint">${keys.length} 个 Key · ${keys.length ? '请求 /v1 需要携带 Authorization: Bearer &lt;key&gt;' : '未启用鉴权'} · 新增或删除立即生效，无需重启</span>
+        </div>
+        ${keys.length ? `<div class="table-wrap"><table>
+          <thead><tr><th>#</th><th>Key</th><th></th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table></div>` : '<div class="empty">还没有 API Key</div>'}
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>添加 Key</h2><span class="hint">留空会自动生成一个 <code>sk-</code> 开头的随机 key；也可以粘贴自己的（至少 8 位、不含空格）</span></div>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <input id="apikey-input" placeholder="留空则自动生成，例如 sk-xxxxxxxx" style="flex:1;min-width:260px" />
+          <button class="btn primary sm" id="apikey-add" type="button">添加</button>
+        </div>
+        <div id="apikey-created" class="hint" style="margin-top:10px"></div>
+      </div>
+    </div>`;
+
+  bindCopy(content());
+  $('#apikey-add').addEventListener('click', createAPIKey);
+  $('#apikey-input').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') createAPIKey();
+  });
+  $$('[data-action="delete-key"]', content()).forEach((button) => {
+    button.addEventListener('click', () => deleteAPIKey(button.dataset.key));
+  });
+}
+
+async function createAPIKey() {
+  const input = $('#apikey-input');
+  const value = input ? input.value.trim() : '';
+  const button = $('#apikey-add');
+  if (button) { button.disabled = true; button.textContent = '添加中…'; }
+  try {
+    const result = await api('/apikeys', { method: 'POST', body: { key: value } });
+    const target = result.generated ? '（已自动生成）' : '';
+    toast(`API Key 已添加${target}`, 'ok');
+    renderAPIKeys(result);
+    const created = $('#apikey-created');
+    if (created) {
+      created.innerHTML = `新 Key：<code>${esc(result.key)}</code> <button class="btn ghost sm" type="button" data-copy="${esc(result.key)}">复制</button>`;
+      bindCopy(created);
+    }
+    const fresh = $('#apikey-input');
+    if (fresh) fresh.value = '';
+  } catch (error) {
+    toast(error.message, 'err');
+  } finally {
+    const current = $('#apikey-add');
+    if (current) { current.disabled = false; current.textContent = '添加'; }
+  }
+}
+
+async function deleteAPIKey(key) {
+  const ok = await confirmDialog('删除 API Key', `确认删除这个 Key？使用它的客户端会立即收到 401。${(state.apikeyCount || 0) <= 1 ? '\n\n这是最后一个 Key，删除后 /v1 将不再鉴权。' : ''}`, '删除');
+  if (!ok) return;
+  try {
+    const result = await api('/apikeys', { method: 'DELETE', body: { key } });
+    state.apikeyCount = result.count;
+    toast(result.count ? 'API Key 已删除' : '已删除最后一个 Key，/v1 现在不鉴权', result.count ? 'ok' : 'err');
+    renderAPIKeys(result);
+  } catch (error) {
+    toast(error.message, 'err');
   }
 }
 

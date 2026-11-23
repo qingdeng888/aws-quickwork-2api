@@ -145,8 +145,8 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		"models":         cfg.Models,
 		"default_model":  cfg.DefaultModel,
 		"auth": map[string]any{
-			"api_key_required": len(cfg.APIKeys) > 0,
-			"api_key_count":    len(cfg.APIKeys),
+			"api_key_required": s.proxy.APIKeyCount() > 0,
+			"api_key_count":    s.proxy.APIKeyCount(),
 		},
 		"accounts": counts,
 		"usage":    s.proxy.ChatStats(),
@@ -193,8 +193,8 @@ func (s *Server) handleEndpoints(w http.ResponseWriter, r *http.Request) {
 	}
 	base := scheme + "://" + r.Host
 	key := "local"
-	if len(cfg.APIKeys) > 0 {
-		key = cfg.APIKeys[0]
+	if keys := s.proxy.APIKeys(); len(keys) > 0 {
+		key = keys[0]
 	}
 	curl := "curl " + base + "/v1/chat/completions \\\n" +
 		"  -H \"Authorization: Bearer " + key + "\" \\\n" +

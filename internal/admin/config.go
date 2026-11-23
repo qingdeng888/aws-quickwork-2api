@@ -252,6 +252,8 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_config", err.Error())
 		return
 	}
+	// Keep runtime authentication in step with the saved file.
+	s.proxy.SetAPIKeys(updated.APIKeys)
 
 	// webui changes take effect without a restart; sessions created under the
 	// previous password are dropped below by the fingerprint check.
@@ -504,7 +506,7 @@ func diffConfig(fileCfg, running *config.Config) []string {
 	}
 	add(fileCfg.Addr != running.Addr, "addr")
 	add(fileCfg.Database != running.Database, "database")
-	add(!equalStrings(fileCfg.APIKeys, running.APIKeys), "api_keys")
+	// api_keys apply immediately through the key manager; no restart needed.
 	add(!equalStrings(fileCfg.Models, running.Models), "models")
 	add(fileCfg.DefaultModel != running.DefaultModel, "default_model")
 	add(fileCfg.RequestTimeout != running.RequestTimeout, "request_timeout")

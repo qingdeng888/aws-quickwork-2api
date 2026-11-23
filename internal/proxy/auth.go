@@ -25,6 +25,8 @@ func adminAuthenticated(r *http.Request) bool {
 // APIKeyAuth validates local proxy API keys from config.json. An empty key
 // list disables authentication for local-only deployments.
 type APIKeyAuth struct {
+	// keys keeps the configured values so the console can list them.
+	keys []string
 	// digests holds sha256 of each key so comparisons are fixed length and
 	// constant time.
 	digests [][sha256.Size]byte
@@ -32,14 +34,32 @@ type APIKeyAuth struct {
 
 func NewAPIKeyAuth(keys []string) *APIKeyAuth {
 	seen := make(map[string]bool, len(keys))
+	clean := make([]string, 0, len(keys))
 	digests := make([][sha256.Size]byte, 0, len(keys))
 	for _, key := range keys {
 		if key = strings.TrimSpace(key); key != "" && !seen[key] {
 			seen[key] = true
+			clean = append(clean, key)
 			digests = append(digests, sha256.Sum256([]byte(key)))
 		}
 	}
-	return &APIKeyAuth{digests: digests}
+	return &APIKeyAuth{keys: clean, digests: digests}
+}
+
+// Count reports how many keys are configured.
+func (a *APIKeyAuth) Count() int {
+	if a == nil {
+		return 0
+	}
+	return len(a.keys)
+}
+
+// Keys returns a copy of the configured keys.
+func (a *APIKeyAuth) Keys() []string {
+	if a == nil {
+		return nil
+	}
+	return append([]string(nil), a.keys...)
 }
 
 func tokenFromRequest(r *http.Request) string {
