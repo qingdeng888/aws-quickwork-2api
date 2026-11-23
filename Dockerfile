@@ -36,7 +36,8 @@ WORKDIR /app
 COPY --from=build /out/quickproxy /app/quickproxy
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 0755 /usr/local/bin/entrypoint.sh \
- && sed -i 's/\r$//' /usr/local/bin/entrypoint.sh
+ && sed -i 's/\r$//' /usr/local/bin/entrypoint.sh \
+ && test "$(head -c 2 /usr/local/bin/entrypoint.sh)" = '#!'
 
 USER qw
 
@@ -56,5 +57,7 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1
 
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+# Run the entrypoint through /bin/sh explicitly: it keeps working even if a
+# checkout loses the executable bit or the shebang line endings drift.
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/entrypoint.sh"]
 CMD ["server"]

@@ -1,3 +1,4 @@
+#!/bin/sh
 # Render the deployment config from environment variables, then start the proxy.
 #
 #   CONFIG_PATH       where config.json lives (default /app/data/config.json)
