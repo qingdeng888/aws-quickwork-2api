@@ -261,6 +261,7 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 | `API_KEYS` | `api_keys` | 逗号分隔；留空则 `/v1` 不鉴权 |
 | `MODELS` / `DEFAULT_MODEL` | 同名 | 逗号分隔的模型别名 |
 | `REQUEST_TIMEOUT` / `MAX_ATTEMPTS` | 同名 | 上游超时与换号次数 |
+| `REFRESH_BEFORE` | `refresh_before` | 到期前多久自动刷新，默认 `10m`；后台每分钟检查一次 |
 | `TIMEZONE` / `LOCALE` | 同名 | 透传给 `user_message` |
 | `THINKING_EFFORT` | 同名 | 空 / `off` / `low` / `medium` / `high` |
 | `SESSION_REUSE` / `SESSION_TTL` / `KEEP_SESSIONS` | 同名 | 上游会话策略 |
@@ -303,7 +304,7 @@ docker compose run --rm -it quickproxy login -manual
 | `api_keys` | 非空才开鉴权；公网场景必须设 |
 | `database` | 相对路径基于 config.json 所在目录；内含 access/refresh token，`chmod 600` |
 | `request_timeout` | 默认 `5m`，反向代理的 read timeout 要大于它 |
-| `refresh_before` | 默认 `10m`，到期前自动 refresh |
+| `refresh_before` | 默认 `10m`：token 进入这个窗口就自动 refresh（请求触发 + 后台每分钟扫一次），`0` 或空值会回到 10m |
 | `max_attempts` | 默认 3，失败换号重试（流式已开始则不换） |
 | `session_reuse` | 默认 true，复用上游 thread 只发新增消息，避开 64 KB 单帧上限 |
 | `chat_agent_id` | 指向自定义 Quick agent，用来甩掉内置 60K token 提示词 |

@@ -141,6 +141,13 @@ func runServer(args []string) int {
 
 	stop, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	// Refresh tokens that enter the refresh window even when no chat request
+	// selects the account, so an idle rotation never lets a token expire.
+	refreshInterval := accounts.RefreshInterval(cfg.RefreshBefore.Duration())
+	log.Printf("account refresh: window=%s sweep=%s", cfg.RefreshBefore.Duration(), refreshInterval)
+	go mgr.KeepFresh(stop, refreshInterval, log.Printf)
+
 	listenErr := make(chan error, 1)
 	go func() {
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

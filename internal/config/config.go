@@ -188,7 +188,7 @@ func applyDefaults(c *Config) {
 	if c.RequestTimeout <= 0 {
 		c.RequestTimeout = d.RequestTimeout
 	}
-	if c.RefreshBefore < 0 {
+	if c.RefreshBefore <= 0 {
 		c.RefreshBefore = d.RefreshBefore
 	}
 	if c.SessionTTL <= 0 {
