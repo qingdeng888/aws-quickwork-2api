@@ -314,9 +314,10 @@ type streamWriter struct {
 	textIndex int
 
 	// Responses output bookkeeping.
-	messageItemID   string
-	messageItemOpen bool
-	outputIndex     int
+	messageItemID      string
+	messageItemOpen    bool
+	messageOutputIndex int
+	outputIndex        int
 
 	textBuf strings.Builder
 	tools   []ToolCall
@@ -418,26 +419,9 @@ func (s *streamWriter) ensureStarted() {
 				"output":     []any{},
 			},
 		})
-		s.event("response.output_item.added", map[string]any{
-			"type":         "response.output_item.added",
-			"output_index": 0,
-			"item": map[string]any{
-				"type":    "message",
-				"id":      s.messageItemID,
-				"status":  "in_progress",
-				"role":    "assistant",
-				"content": []any{},
-			},
-		})
-		s.messageItemOpen = true
-		s.outputIndex = 1
-		s.event("response.content_part.added", map[string]any{
-			"type":          "response.content_part.added",
-			"item_id":       s.messageItemID,
-			"output_index":  0,
-			"content_index": 0,
-			"part":          map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
-		})
+		// The assistant message item is opened lazily by textDelta: an answer
+		// that only contains tool calls must not carry an empty message."""
+		s.outputIndex = 0
 	default:
 		s.data(map[string]any{
 			"id":      s.id,
@@ -475,10 +459,33 @@ func (s *streamWriter) textDelta(text string) {
 			"delta": map[string]any{"type": "text_delta", "text": text},
 		})
 	case wireResponses:
+		if !s.messageItemOpen {
+			s.messageItemOpen = true
+			s.messageOutputIndex = s.outputIndex
+			s.outputIndex++
+			s.event("response.output_item.added", map[string]any{
+				"type":         "response.output_item.added",
+				"output_index": s.messageOutputIndex,
+				"item": map[string]any{
+					"type":    "message",
+					"id":      s.messageItemID,
+					"status":  "in_progress",
+					"role":    "assistant",
+					"content": []any{},
+				},
+			})
+			s.event("response.content_part.added", map[string]any{
+				"type":          "response.content_part.added",
+				"item_id":       s.messageItemID,
+				"output_index":  s.messageOutputIndex,
+				"content_index": 0,
+				"part":          map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+			})
+		}
 		s.event("response.output_text.delta", map[string]any{
 			"type":          "response.output_text.delta",
 			"item_id":       s.messageItemID,
-			"output_index":  0,
+			"output_index":  s.messageOutputIndex,
 			"content_index": 0,
 			"delta":         text,
 		})
@@ -519,20 +526,20 @@ func (s *streamWriter) closeMessageItem() {
 	s.event("response.output_text.done", map[string]any{
 		"type":          "response.output_text.done",
 		"item_id":       s.messageItemID,
-		"output_index":  0,
+		"output_index":  s.messageOutputIndex,
 		"content_index": 0,
 		"text":          text,
 	})
 	s.event("response.content_part.done", map[string]any{
 		"type":          "response.content_part.done",
 		"item_id":       s.messageItemID,
-		"output_index":  0,
+		"output_index":  s.messageOutputIndex,
 		"content_index": 0,
 		"part":          map[string]any{"type": "output_text", "text": text, "annotations": []any{}},
 	})
 	s.event("response.output_item.done", map[string]any{
 		"type":         "response.output_item.done",
-		"output_index": 0,
+		"output_index": s.messageOutputIndex,
 		"item":         responsesMessageItem(s.messageItemID, text, "completed"),
 	})
 }

@@ -493,3 +493,37 @@ func TestE2EAssistantHistoryWithToolResults(t *testing.T) {
 }
 
 var _ = fmt.Sprintf
+
+func TestE2EResponsesStreamingToolOnlyHasNoMessageItem(t *testing.T) {
+	upstream := newFakeUpstream(t, `<client_tool_call>{"name":"read","arguments":{"path":"a"}}</client_tool_call>`)
+	s := testProxyServer(t, upstream)
+
+	rec := serve(t, s, s.handleResponses, "/v1/responses", `{
+	  "model":"smart","stream":true,"input":"read a",
+	  "tools":[{"type":"function","name":"read","parameters":{"type":"object"}}],
+	  "tool_choice":"required"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, `"type":"message"`) {
+		t.Fatalf("a tool-only answer must not emit an empty message item:\n%s", body)
+	}
+	if !strings.Contains(body, "event: response.function_call_arguments.done") {
+		t.Fatalf("missing function call events:\n%s", body)
+	}
+	// The completed response carries only the function_call item.
+	var output []any
+	for _, p := range parseSSE(t, body) {
+		if p["type"] == "response.completed" {
+			resp, _ := p["response"].(map[string]any)
+			output, _ = resp["output"].([]any)
+		}
+	}
+	if len(output) != 1 {
+		t.Fatalf("output = %+v", output)
+	}
+	if item, _ := output[0].(map[string]any); item["type"] != "function_call" {
+		t.Errorf("output item = %+v", output[0])
+	}
+}
