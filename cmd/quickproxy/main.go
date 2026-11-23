@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"quickwork-openai/internal/accounts"
+	"quickwork-openai/internal/admin"
 	"quickwork-openai/internal/config"
 	"quickwork-openai/internal/oauth"
 	"quickwork-openai/internal/proxy"
@@ -40,6 +43,10 @@ func run(args []string) int {
 		return refreshAccounts(args[1:])
 	case "logout":
 		return logout(args[1:])
+	case "passwd":
+		return setPassword(args[1:])
+	case "config":
+		return renderConfig(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return 0
@@ -64,6 +71,8 @@ Usage:
   quickproxy accounts [-config config.json]
   quickproxy refresh  [-config config.json] [-account ID]
   quickproxy logout   [-config config.json] (-all | -account ID)
+  quickproxy passwd   [-config config.json] [-password PW]
+  quickproxy config   [-config config.json] [-from-env=false]
 
 Running without a subcommand is equivalent to "server".
 
@@ -104,7 +113,10 @@ func runServer(args []string) int {
 
 	mgr := accounts.New(st, cfg)
 	count, _ := mgr.EnabledCount(context.Background())
-	handler := proxy.NewServer(cfg, mgr).Handler()
+	px := proxy.NewServer(cfg, mgr)
+	adminUI := admin.New(cfg, st, mgr, px)
+	px.MountAdmin("/admin/", adminUI.Handler())
+	handler := px.Handler()
 	server := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,
@@ -119,6 +131,12 @@ func runServer(args []string) int {
 		cfg.RefreshBefore.Duration(), cfg.MaxAttempts, cfg.KeepSessions, cfg.SessionReuse, cfg.SessionTTL.Duration())
 	if count == 0 {
 		log.Printf("no accounts stored; run `quickproxy login` to add one")
+	}
+	switch {
+	case !cfg.WebUIReady():
+		log.Printf("management interface off: set webui.password or run `quickproxy passwd -password <pw>` to enable /admin")
+	default:
+		log.Printf("management interface on: %s/admin/", baseURL(cfg.Addr))
 	}
 
 	stop, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -378,4 +396,122 @@ func formatEpoch(v int64) string {
 		return "unknown"
 	}
 	return time.Unix(v, 0).Local().Format("2006-01-02 15:04")
+}
+
+// adminURL turns the configured listen address into something clickable.
+func baseURL(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port)
+}
+
+// setPassword stores a pbkdf2-sha256 hash of the management password in
+// config.json and clears any plaintext password, which is what the login
+// endpoint reads.
+// renderConfig writes config.json with environment overrides applied. The
+// container entrypoint runs it before starting the server so .env drives the
+// deployment while accounts and other fields stay in the data volume.
+func renderConfig(args []string) int {
+	fs := flag.NewFlagSet("config", flag.ExitOnError)
+	configPath := fs.String("config", "config.json", "path to config.json")
+	fromEnv := fs.Bool("from-env", true, "apply ADDR, API_KEYS, WEBUI_PASSWORD and friends from the environment")
+	_ = fs.Parse(args)
+
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "config:", err)
+		return 1
+	}
+	var applied []string
+	if *fromEnv {
+		applied, err = config.ApplyEnv(cfg, os.LookupEnv)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "config:", err)
+			return 1
+		}
+	}
+	if err := cfg.Validate(); err != nil {
+		fmt.Fprintln(os.Stderr, "config:", err)
+		return 1
+	}
+	if err := config.Save(cfg); err != nil {
+		fmt.Fprintln(os.Stderr, "save config:", err)
+		return 1
+	}
+	fmt.Printf("config %s written: addr=%s models=%s api_keys=%d webui=%s\n",
+		cfg.Path, cfg.Addr, strings.Join(cfg.Models, ","), len(cfg.APIKeys), webuiState(cfg))
+	if len(applied) == 0 {
+		fmt.Println("env overrides: none")
+	} else {
+		fmt.Printf("env overrides: %s\n", strings.Join(applied, ", "))
+	}
+	return 0
+}
+
+// webuiState summarizes whether /admin will be reachable after this config.
+func webuiState(cfg *config.Config) string {
+	if cfg.WebUI == nil || !cfg.WebUI.Enabled {
+		return "off"
+	}
+	switch {
+	case strings.TrimSpace(cfg.WebUI.PasswordHash) != "":
+		return "on (password_hash)"
+	case strings.TrimSpace(cfg.WebUI.Password) != "":
+		return "on (password)"
+	default:
+		return "on but no password -> /admin returns 503"
+	}
+}
+
+func setPassword(args []string) int {
+	fs := flag.NewFlagSet("passwd", flag.ExitOnError)
+	configPath := fs.String("config", "config.json", "path to config.json")
+	password := fs.String("password", "", "management password (read from stdin when empty)")
+	_ = fs.Parse(args)
+
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "config:", err)
+		return 1
+	}
+	value := *password
+	if value == "" {
+		fmt.Fprint(os.Stderr, "management password: ")
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil && line == "" {
+			fmt.Fprintln(os.Stderr, "read password:", err)
+			return 1
+		}
+		value = strings.TrimRight(line, "\r\n")
+	}
+	hash, err := config.HashPassword(value)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "passwd:", err)
+		return 1
+	}
+	if cfg.WebUI == nil {
+		cfg.WebUI = &config.WebUI{}
+	}
+	cfg.WebUI.Enabled = true
+	cfg.WebUI.PasswordHash = hash
+	cfg.WebUI.Password = ""
+	if cfg.WebUI.SessionTTL <= 0 {
+		cfg.WebUI.SessionTTL = config.Duration(12 * time.Hour)
+	}
+	if cfg.WebUI.MaxAttempts <= 0 {
+		cfg.WebUI.MaxAttempts = 10
+	}
+	if err := config.Save(cfg); err != nil {
+		fmt.Fprintln(os.Stderr, "save config:", err)
+		return 1
+	}
+	fmt.Printf("management password updated in %s (pbkdf2-sha256)\n", cfg.Path)
+	fmt.Printf("restart `quickproxy server` if it is running, then open %s/admin/\n", baseURL(cfg.Addr))
+	return 0
 }

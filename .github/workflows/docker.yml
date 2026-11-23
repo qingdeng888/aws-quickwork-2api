@@ -1,0 +1,140 @@
+name: docker
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  image:
+    name: build and push image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image name
+        id: image
+        run: echo "name=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Provenance attestations force some older clients to pass a flag to
+          # pull; keep the manifest simple for a proxy image.
+          provenance: false
+
+  smoke:
+    name: image smoke test (amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build local image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: aws-quickwork-2api:ci
+          cache-from: type=gha,scope=smoke
+          cache-to: type=gha,mode=max,scope=smoke
+
+      - name: Run container and probe endpoints
+        run: |
+          set -euo pipefail
+          docker run -d --name qw -p 18080:8080 \
+            -e WEBUI_PASSWORD=ci-password-123 \
+            -e API_KEYS=sk-ci \
+            -e TIMEZONE=UTC \
+            aws-quickwork-2api:ci
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/healthz >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          echo "== healthz"
+          curl -fsS http://127.0.0.1:18080/healthz; echo
+          echo "== /v1/models with key"
+          curl -fsS http://127.0.0.1:18080/v1/models -H 'Authorization: Bearer sk-ci'; echo
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/v1/models)
+          echo "== /v1/models without key -> $code"; test "$code" = "401"
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/admin/)
+          echo "== /admin/ -> $code"; test "$code" = "200"
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/admin/api/overview)
+          echo "== /admin/api/overview unauthenticated -> $code"; test "$code" = "401"
+
+          curl -fsS -X POST http://127.0.0.1:18080/admin/api/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"password":"ci-password-123"}' -o /tmp/login.json
+          grep -q '"csrf_token"' /tmp/login.json
+          echo "== admin login ok"
+
+          echo "== rendered config"
+          docker exec qw cat /app/data/config.json
+          docker exec qw sh -c 'grep -q "0.0.0.0:8080" /app/data/config.json'
+          docker exec qw sh -c 'grep -q "ci-password-123" /app/data/config.json'
+          docker exec qw sh -c 'test -f /app/data/quickwork.db'
+          echo "== smoke test passed"
+
+      - name: Container logs
+        if: failure()
+        run: docker logs qw || true
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f qw || true

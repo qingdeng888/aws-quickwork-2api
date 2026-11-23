@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>QuickWork Console</title>
+    <link rel="stylesheet" href="/admin/styles.css" />
+  </head>
+  <body>
+    <section id="login" class="login-screen">
+      <div class="login-art">
+        <div class="brand-mark">QW</div>
+        <div class="eyebrow">QUICKWORK · OPENAI BRIDGE</div>
+        <h1>把 QuickWork 的会话<br />接到 <span class="accent">OpenAI 接口</span>上。</h1>
+        <p class="lede">
+          与命令行同一套能力，现在有了控制台：账号轮询、OAuth 登录、请求日志与 Playground，
+          全部跑在同一个端口、同一个进程里。
+        </p>
+        <ul class="login-points">
+          <li><b>01</b><span><code>/admin</code> 管理界面，<code>/v1</code> 保持 OpenAI 兼容</span></li>
+          <li><b>02</b><span>密码保护 + CSRF 校验 + 登录限速</span></li>
+          <li><b>03</b><span>账号 token 到期自动刷新，多账号轮询</span></li>
+        </ul>
+      </div>
+
+      <form id="login-form" class="login-card" autocomplete="off">
+        <div class="eyebrow">RESTRICTED CONSOLE</div>
+        <h2>管理登录</h2>
+        <p class="muted">密码来自 <code>config.json</code> 的 <code>webui.password</code>（或 <code>webui.password_hash</code>）。</p>
+        <label class="field">
+          <span>管理密码</span>
+          <input id="login-password" type="password" autocomplete="current-password" placeholder="••••••••" required />
+        </label>
+        <button class="btn primary wide" id="login-submit" type="submit">进入控制台</button>
+        <div id="login-error" class="form-error" role="alert"></div>
+        <div class="login-foot">
+          <span>SINGLE BINARY · GO</span>
+          <span id="login-status">检查服务…</span>
+        </div>
+      </form>
+    </section>
+
+    <div id="app" class="app hidden">
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <div class="brand-row">
+            <div class="brand-mark">QW</div>
+            <div>
+              <div class="brand-name">QuickWork</div>
+              <div class="brand-sub">Console</div>
+            </div>
+          </div>
+        </div>
+
+        <nav class="nav" id="nav">
+          <button data-page="overview" class="active"><span class="nav-ico">▣</span><span>总览</span></button>
+          <button data-page="accounts"><span class="nav-ico">▤</span><span>账号</span></button>
+          <button data-page="login"><span class="nav-ico">⚿</span><span>登录上游</span></button>
+          <button data-page="config"><span class="nav-ico">⚙</span><span>配置</span></button>
+          <button data-page="logs"><span class="nav-ico">▦</span><span>请求日志</span></button>
+          <button data-page="playground"><span class="nav-ico">◈</span><span>Playground</span></button>
+        </nav>
+
+        <div class="sidebar-foot">
+          <div class="live-line"><span class="live-dot"></span><span>CONTROL PLANE LIVE</span></div>
+          <div class="sidebar-actions">
+            <button class="btn ghost sm" id="theme-toggle" type="button">浅色</button>
+            <button class="btn ghost sm" id="logout" type="button">退出</button>
+          </div>
+          <div class="mono" id="revision">revision —</div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <div class="eyebrow" id="page-eyebrow">SECTION 01</div>
+            <h1 id="page-title">总览</h1>
+          </div>
+          <div class="topbar-actions" id="topbar-actions"></div>
+        </header>
+        <div class="content" id="content"></div>
+      </main>
+    </div>
+
+    <div class="toasts" id="toasts"></div>
+
+    <div class="modal hidden" id="modal">
+      <div class="modal-card">
+        <h3 id="modal-title">确认</h3>
+        <p id="modal-body"></p>
+        <div class="modal-actions">
+          <button class="btn ghost" id="modal-cancel" type="button">取消</button>
+          <button class="btn danger" id="modal-confirm" type="button">确认</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/admin/app.js"></script>
+  </body>
+</html>

@@ -49,6 +49,19 @@ type OAuth struct {
 	Timeout      Duration `json:"timeout"`
 }
 
+// WebUI configures the password-protected management interface served under
+// /admin on the proxy's own address. Password holds a plaintext password;
+// PasswordHash (pbkdf2-sha256, written by `quickproxy passwd -set`) wins when
+// both are present. With neither set the management interface stays off.
+type WebUI struct {
+	Enabled      bool     `json:"enabled"`
+	Password     string   `json:"password"`
+	PasswordHash string   `json:"password_hash"`
+	SessionTTL   Duration `json:"session_ttl"`
+	MaxAttempts  int      `json:"max_attempts"`
+	TrustProxy   bool     `json:"trust_proxy"`
+}
+
 // Config is the server configuration stored in config.json.
 type Config struct {
 	Addr             string   `json:"addr"`
@@ -71,6 +84,7 @@ type Config struct {
 	SessionReuse     bool     `json:"session_reuse"`
 	SessionTTL       Duration `json:"session_ttl"`
 	OAuth            OAuth    `json:"oauth"`
+	WebUI            *WebUI   `json:"webui,omitempty"`
 
 	// Path is the absolute config file path; not serialized.
 	Path string `json:"-"`
@@ -100,6 +114,11 @@ func Default() Config {
 			BuildStage:   "prod",
 			CallbackPort: 18080,
 			Timeout:      Duration(time.Hour),
+		},
+		WebUI: &WebUI{
+			Enabled:     true,
+			SessionTTL:  Duration(12 * time.Hour),
+			MaxAttempts: 10,
 		},
 	}
 }
@@ -202,6 +221,16 @@ func applyDefaults(c *Config) {
 	if c.OAuth.Timeout <= 0 {
 		c.OAuth.Timeout = d.OAuth.Timeout
 	}
+	if c.WebUI == nil {
+		c.WebUI = d.WebUI
+	} else {
+		if c.WebUI.SessionTTL <= 0 {
+			c.WebUI.SessionTTL = d.WebUI.SessionTTL
+		}
+		if c.WebUI.MaxAttempts <= 0 {
+			c.WebUI.MaxAttempts = d.WebUI.MaxAttempts
+		}
+	}
 }
 
 func (c *Config) validate() error {
@@ -221,5 +250,25 @@ func (c *Config) validate() error {
 	default:
 		return fmt.Errorf("oauth.build_stage must be prod, beta, integ or dev")
 	}
+	if c.WebUI == nil {
+		return fmt.Errorf("webui block is missing")
+	}
+	if c.WebUI.SessionTTL <= 0 {
+		return fmt.Errorf("webui.session_ttl must be positive")
+	}
+	if c.WebUI.MaxAttempts < 1 || c.WebUI.MaxAttempts > 100 {
+		return fmt.Errorf("webui.max_attempts must be between 1 and 100")
+	}
+	if c.WebUI.PasswordHash != "" && !ValidPasswordHash(c.WebUI.PasswordHash) {
+		return fmt.Errorf("webui.password_hash is not a pbkdf2-sha256 hash; run `quickproxy passwd -set`")
+	}
 	return nil
+}
+
+// Save writes the configuration back to the file it was loaded from.
+func Save(cfg *Config) error {
+	if cfg == nil || strings.TrimSpace(cfg.Path) == "" {
+		return errors.New("config path is not set")
+	}
+	return write(cfg.Path, cfg)
 }

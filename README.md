@@ -25,6 +25,8 @@
 - `system` / `developer` 消息与工具定义放在本轮 user 文本开头的 `[System instructions from the API caller]` 区块内；上游会忽略每轮 `system_prompt` 字段，并把 `custom_prompt` 当作低信任的个人偏好，user 轮次是唯一可靠送达调用方指令的通道
 - 64 KB 单帧预算按实际 JSON 字节计算：用户内容过大时优先走 out-of-band 附件（`upload-attachment` → DLP 扫描 → `files/upload`），WebSocket 只发送短引用与 `attachments` 元数据；附件只包含用户内容，调用方指令仍留在 WS 文本里。附件不可用时才裁剪、保留开头与结尾，避免直接返回 `request_too_large`
 - `chat_agent_id` 可指定一个 QuickWork 自定义 agent，以替代默认内置 agent 的提示词与工具策略
+- `/admin` 密码保护的管理前端，与 `/v1` 共用端口和进程：账号列表 / 刷新 / 删除、网页内完成 OAuth 登录（手动回填或本机回调）、配置编辑、请求日志与 Playground
+- 一条 `docker compose up -d` 即可部署：镜像由 GitHub Actions 构建并推送到 GHCR，`.env` 定义端口、管理密码与 API key
 
 ## 环境要求
 
@@ -185,6 +187,12 @@ for chunk in client.chat.completions.create(
 | `oauth.region` | 空 | 企业 discovery 的 region 前缀；social 使用 discovery 返回的 IDC region |
 | `oauth.callback_port` | `18080` | 本机 OAuth 回调端口 |
 | `oauth.timeout` | `1h` | 等待浏览器完成登录的超时 |
+| `webui.enabled` | `true` | 是否提供 `/admin` 管理前端 |
+| `webui.password` | 空 | 管理密码（明文）；为空且没有 `password_hash` 时管理前端返回 503 |
+| `webui.password_hash` | 空 | pbkdf2-sha256 哈希，优先于 `webui.password`；由 `quickproxy passwd` 写入 |
+| `webui.session_ttl` | `12h` | 管理登录会话有效期 |
+| `webui.max_attempts` | `10` | 同一 IP 每 5 分钟允许的登录失败次数，超出返回 429 |
+| `webui.trust_proxy` | `false` | 是否采信 `X-Forwarded-For` 作为登录限速的客户端 IP |
 
 时间字段接受 Go duration 字符串（`30s`、`5m`、`1h`）。
 
@@ -209,6 +217,8 @@ for chunk in client.chat.completions.create(
 | `quickproxy refresh -account ID` | 只刷新一个账号 |
 | `quickproxy logout -all` | 删除全部账号 |
 | `quickproxy logout -account ID` | 删除一个账号 |
+| `quickproxy passwd` | 设置管理密码，写入 `webui.password_hash` 并清空明文 |
+| `quickproxy config -from-env` | 把环境变量合并进 `config.json`（容器 entrypoint 启动前调用） |
 
 所有命令都支持 `-config PATH`，默认 `config.json`。
 
@@ -225,6 +235,80 @@ for chunk in client.chat.completions.create(
 | `-timeout` | `config.oauth.timeout` | 等待浏览器完成登录的超时 |
 | `-open` | 关闭 | 同时用默认浏览器打开 URL |
 | `-manual` | 关闭 | 不监听本地回调端口，手动粘贴浏览器地址栏中的 callback URL（适合服务器） |
+
+## 管理前端 `/admin`
+
+管理前端和 OpenAI 接口**共用同一个端口、同一个进程**：`/v1` 走 API，`/admin` 走界面，静态资源编译进二进制，没有 npm 构建步骤，也没有额外监听端口。
+
+```bash
+# 1. 设置管理密码（写入 config.json 的 webui.password_hash）
+./bin/quickproxy passwd -password '你的密码'
+
+# 2. 启动服务
+./bin/quickproxy server
+# log: management interface on: http://127.0.0.1:8080/admin/
+```
+
+也可以直接在 `config.json` 里写明文密码，适合先跑起来：
+
+```json
+{
+  "webui": {
+    "enabled": true,
+    "password": "改成你的密码",
+    "session_ttl": "12h",
+    "max_attempts": 10,
+    "trust_proxy": false
+  }
+}
+```
+
+页面能力：
+
+| 页面 | 功能 |
+|---|---|
+| 总览 | 监听地址、运行时长、账号健康、最近请求统计、token 合计、接入信息（一键复制 curl / Python / Base URL）、生效配置 |
+| 账号 | 账号列表（provider、区域、到期倒计时、使用次数、`last_error`）、单个/全部刷新 token、删除账号 |
+| 登录上游 | 在网页里完成 OAuth：手动模式粘贴浏览器 callback URL，本机模式直接走 `127.0.0.1:18080` 回调；实时输出流程日志与可点击的授权链接 |
+| 配置 | 编辑 `config.json` 的主要字段；`webui` 段落保存后立即生效，其余字段在下次启动生效并在页面上标注 |
+| 请求日志 | 最近 500 条聊天请求的状态、模型、账号、耗时、token、`finish_reason` 与错误 |
+| Playground | 直接走完整上游链路测试对话，支持流式；用管理会话鉴权，不需要本地 API key |
+
+鉴权与安全：
+
+- 登录只校验一个密码，成功后在 `Path=/admin` 下发 `HttpOnly` + `SameSite=Strict`（HTTPS 下附带 `Secure`）的会话 cookie；会话表按 cookie 的 SHA-256 索引，密码一变立刻失效。
+- 所有写操作要求 `X-CSRF-Token`，并校验 `Origin` 与 `Host` 一致，避免跨站表单和跨站 fetch。
+- 登录失败按客户端 IP 做 5 分钟窗口限速（`webui.max_attempts`），同时最多 4 个 PBKDF2 计算并发，防止把管理密码当靶子。
+- 没有配置密码时，`/admin` 下所有路径返回 503 并提示怎么设置；`/v1` 完全不受影响。
+- 管理端点带 `Content-Security-Policy: default-src 'self'`、`X-Frame-Options: DENY`、`X-Content-Type-Options: nosniff`，且不返回 CORS 头，避免被第三方页面驱动。
+- `webui.trust_proxy` 默认关闭。挂在反向代理后面又需要按真实客户端 IP 限速时，才打开它并确保代理会覆盖 `X-Forwarded-For`。
+
+管理 API（全部在 `/admin/api` 下）：`POST /auth/login`、`GET /auth/session`、`POST /auth/logout`、`GET /overview`、`GET /endpoints`、`GET /accounts`、`POST /accounts/refresh`、`DELETE /accounts/{id}`、`POST /accounts/login`、`GET /accounts/login/{id}`、`POST /accounts/login/{id}/callback`、`DELETE /accounts/login/{id}`、`GET /config`、`PUT /config`、`GET /logs`、`POST /playground`。
+
+## Docker 部署
+
+仓库自带镜像构建、Compose 和 CI，默认使用 Actions 推到 GHCR 的预构建镜像：
+
+```bash
+cp .env.example .env        # 至少改 WEBUI_PASSWORD、API_KEYS
+docker compose pull
+docker compose up -d
+# 打开 http://127.0.0.1:<WEB_PORT>/admin/
+```
+
+| 文件 | 作用 |
+|---|---|
+| `Dockerfile` | 多阶段构建，最终 `alpine` 镜像以 uid 10001 非 root 运行 |
+| `docker/entrypoint.sh` | 启动前 `quickproxy config -from-env`，把环境变量渲染进 `config.json` |
+| `docker-compose.yml` | 默认 `image: ghcr.io/qingdeng888/aws-quickwork-2api:latest`，挂载 `./data`，带 healthcheck |
+| `docker-compose.build.yml` | 叠加使用即改为本地构建：`docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build` |
+| `.env.example` | 端口、管理密码、API key、OAuth 与模型等变量模板 |
+| `.github/workflows/docker.yml` | push `main` / 打 `v*` tag 构建 amd64+arm64 推到 GHCR，并对 amd64 镜像做冒烟测试 |
+
+- 所有持久化数据都在 `./data`：`config.json` + `quickwork.db`。Linux 上先 `sudo chown -R 10001:10001 ./data`。
+- `.env` 的变量每次启动都会合并进 `config.json`（空值不覆盖）；`CONFIG_FROM_ENV=false` 可关闭。密码想以 `/admin` 修改为准，就把 `WEBUI_PASSWORD` 留空或改用 `WEBUI_PASSWORD_HASH`。
+- 宿主机浏览器无法回调容器里的 `127.0.0.1:18080`，容器内请在 `/admin` → 登录上游 用「手动回填 callback URL」，或执行 `docker compose run --rm -it quickproxy login -manual`。
+- 环境变量与配置字段的完整对照见 [DEPLOY.md](DEPLOY.md#6-常驻运行)。
 
 ## 多账号轮询
 
@@ -311,6 +395,7 @@ chat chatcmpl-... done status=ok account=1:social:user@example.com model=smart a
 - 当单个 `user_message` 超过 64 KB 且账号有 `tenant_url` 时，代理会把该轮用户内容作为临时文本附件上传到 Quick 的附件服务并等待 DLP 扫描；这是绕过单帧上限的方式，内容仍位于你的 Quick 租户内，但受组织 DLP 策略约束。
 - `config.json` 默认不含密钥；如果写入 `api_keys`，不要提交真实 key。
 - 登录密码只在 Amazon 的浏览器页面中输入，本项目不会保存密码。
+- 管理密码保存在 `config.json`：用 `quickproxy passwd` 写入的是 PBKDF2-SHA256 哈希；直接写 `webui.password` 则是明文，记得给文件设 `600`。管理会话只存在内存，重启即失效。
 - 反代默认只监听 `127.0.0.1`。不要把端口直接暴露到公网；如确需远程访问，请自行加 TLS 与访问控制。
 - `quickproxy logout -all` 会删除本地账号与 refresh 状态。
 - 不要提交或分享 `data/` 目录。
@@ -343,18 +428,35 @@ chat chatcmpl-... done status=ok account=1:social:user@example.com model=smart a
 | 登录页面报错 | 查看终端输出的错误；确认 `-provider` 与账号类型匹配 |
 | 多账号请求总是失败 | 运行 `quickproxy accounts` 查看 `last_error`；对失效账号重新 `login` 或 `logout -account ID` |
 | token 过期 | 通常自动刷新；也可运行 `quickproxy refresh` |
+| `/admin` 返回 503 `admin_disabled` | 还没设置管理密码：`quickproxy passwd -password '...'` 或写 `webui.password`，然后重启 |
+| `/admin` 登录一直提示密码错误 | 确认改的是当前 `-config` 指向的那份 `config.json`；`webui.password_hash` 存在时会忽略 `webui.password` |
+| `/admin` 提示 429 | 5 分钟内失败次数超过 `webui.max_attempts`；等待窗口过期，或调大该值 |
+| 网页里点「开始登录」后本机模式一直等待 | 浏览器必须能访问服务器的 `127.0.0.1:<callback_port>`；远程用「手动回填」模式 |
+| 配置页保存后提示「等待重启」 | `webui` 之外的字段只在下次启动生效，重启 `quickproxy server` 即可 |
+| `docker compose up` 报 `env file .env not found` | 先 `cp .env.example .env`，compose 默认从这个文件读取变量 |
+| `docker compose pull` 报 `unauthorized` / `denied` | GHCR 包默认私有：在 GitHub 的 package 设置里改成 public，或先 `docker login ghcr.io` |
+| 容器起来了但 `/admin` 返回 503 | `.env` 里 `WEBUI_PASSWORD` 为空；填一个至少 8 位的密码后 `docker compose up -d` |
+| Linux 上容器报 `permission denied` 写 `/app/data` | 绑定目录归宿主用户所有，先 `sudo chown -R 10001:10001 ./data` |
 
 ## 目录
 
 ```
 quickwork-openai/
   config.json              服务端配置（首次运行自动生成）
-  cmd/quickproxy/          CLI：server / login / accounts / refresh / logout
-  internal/config/         config.json 加载与默认值
+  cmd/quickproxy/          CLI：server / login / accounts / refresh / logout / passwd / config
+  internal/config/         config.json 加载与默认值、环境变量合并、管理密码哈希
   internal/oauth/          原生 OAuth、PKCE、token refresh、user info
   internal/store/          SQLite 账号存储
   internal/accounts/       多账号轮询与自动刷新
-  internal/proxy/          WebSocket codec、OpenAI handler
+  internal/proxy/          WebSocket codec、OpenAI handler、请求记录
+  internal/admin/          /admin 管理 API：会话、CSRF、限速、登录流、配置、日志
+  webui/                   管理前端（index.html / app.js / styles.css，go:embed）
+  Dockerfile               多阶段镜像构建（非 root 运行）
+  docker/entrypoint.sh     容器启动：env → config.json → server
+  docker-compose.yml       预构建镜像部署（GHCR）
+  docker-compose.build.yml 本地构建覆盖层
+  .env.example             部署变量模板
+  .github/workflows/       release.yml（二进制）+ docker.yml（镜像）
   data/quickwork.db        运行期账号库（gitignored）
 ```
 

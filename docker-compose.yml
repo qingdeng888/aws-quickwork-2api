@@ -1,0 +1,40 @@
+# Docker Compose deployment for aws-quickwork-2api.
+#
+#   cp .env.example .env      # edit the port, password and API keys
+#   docker compose pull       # use the prebuilt image from GHCR
+#   docker compose up -d
+#   open http://127.0.0.1:8080/admin/
+#
+# Build the image locally instead of pulling it:
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# `env_file: .env` is required: the entrypoint renders config.json from those
+# variables on every start, so changes in .env apply after `docker compose up -d`
+# (which recreates the container).
+
+services:
+  quickproxy:
+    image: ${IMAGE:-ghcr.io/qingdeng888/aws-quickwork-2api:latest}
+    container_name: ${CONTAINER_NAME:-quickproxy}
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      # Host port comes from .env; the container always listens on 8080.
+      - "${WEB_PORT:-8080}:8080"
+    volumes:
+      # config.json and quickwork.db both live here: back up this one directory.
+      - ./data:/app/data
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

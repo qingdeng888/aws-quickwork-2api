@@ -1,0 +1,20 @@
+# Build context for the runtime image. Only the Go sources and docker/ are
+# needed; the uncommented entries would otherwise leak local state into the
+# image layer.
+.git
+.github
+.gitignore
+.gitattributes
+bin
+dist
+data
+.tmp
+*.log
+*.db
+*.db-shm
+*.db-wal
+*.exe
+.env
+.env.*
+Dockerfile
+docker-compose*.yml

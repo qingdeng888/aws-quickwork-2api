@@ -1,0 +1,15 @@
+# Local build overlay: builds the image from this checkout instead of pulling
+# it from GHCR.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# The image is tagged aws-quickwork-2api:local, so IMAGE in .env is ignored here.
+
+services:
+  quickproxy:
+    image: aws-quickwork-2api:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GO_VERSION: ${GO_VERSION:-1.26}

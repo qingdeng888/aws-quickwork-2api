@@ -29,5 +29,13 @@
     "region": "",
     "callback_port": 18080,
     "timeout": "1h"
+  },
+  "webui": {
+    "enabled": true,
+    "password": "",
+    "password_hash": "",
+    "session_ttl": "12h",
+    "max_attempts": 10,
+    "trust_proxy": false
   }
 }

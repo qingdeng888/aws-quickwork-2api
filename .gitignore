@@ -12,3 +12,10 @@ dist/
 # Local artifacts
 page-signup.png
 *.log
+
+# Local scratch (test configs, screenshots, browser profiles)
+.tmp/
+
+# Local deployment secrets
+.env
+.env.local

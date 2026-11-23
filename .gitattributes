@@ -1,0 +1,8 @@
+# Keep shell scripts and container/CI files LF so they stay runnable inside
+# Linux images and runners regardless of the contributor's core.autocrlf.
+*.sh            text eol=lf
+Dockerfile      text eol=lf
+*.dockerignore  text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+.env.example    text eol=lf

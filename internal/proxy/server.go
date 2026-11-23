@@ -21,6 +21,12 @@ type Server struct {
 	tokens   *APIKeyAuth
 	upstream *Upstream
 	sessions *conversationStore
+	records  chatRecorder
+
+	// adminHandler, when set by MountAdmin, is served under adminPrefix on the
+	// same listener as the OpenAI-compatible API.
+	adminHandler http.Handler
+	adminPrefix  string
 }
 
 func NewServer(cfg *config.Config, mgr *accounts.Manager) *Server {
@@ -38,11 +44,50 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChat)
+	if s.adminHandler != nil {
+		prefix := s.adminPrefix
+		if prefix == "" {
+			prefix = "/admin/"
+		}
+		trimmed := strings.TrimSuffix(prefix, "/")
+		mux.Handle(trimmed, http.RedirectHandler(prefix, http.StatusTemporaryRedirect))
+		mux.Handle(prefix, s.adminHandler)
+	}
 	return s.withCORS(mux)
 }
 
+// MountAdmin serves h under prefix on the proxy's own listener, so the
+// management UI and the API share an address. It must be called before
+// Handler.
+func (s *Server) MountAdmin(prefix string, h http.Handler) {
+	if prefix == "" {
+		prefix = "/admin/"
+	}
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	s.adminPrefix = prefix
+	s.adminHandler = h
+}
+
+// ChatHandler exposes the chat endpoint for the management UI playground,
+// which reuses the full upstream path in-process.
+func (s *Server) ChatHandler() http.Handler { return http.HandlerFunc(s.handleChat) }
+
+// ChatRecords returns up to limit finished requests, newest first.
+func (s *Server) ChatRecords(limit int) []ChatRecord { return s.records.list(limit) }
+
+// ChatStats aggregates the requests currently held in memory.
+func (s *Server) ChatStats() ChatStats { return s.records.stats() }
+
 func (s *Server) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The management interface is same-origin only: a wildcard CORS
+		// header would let any page on the internet drive it with cookies.
+		if strings.HasPrefix(r.URL.Path, "/admin") {
+			next.ServeHTTP(w, r)
+			return
+		}
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Api-Key, X-Thread-Id, X-Conversation-Id")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -85,7 +130,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST required")
 		return
 	}
-	if !s.tokens.Allowed(r) {
+	if !s.tokens.Allowed(r) && !adminAuthenticated(r) {
 		writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "invalid proxy API key")
 		return
 	}
@@ -251,7 +296,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			case errors.Is(lastErr, ErrUserMessageTooLarge):
 				status, code = http.StatusBadRequest, "request_too_large"
 			}
-			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
+			s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
 			return
 		}
@@ -273,7 +318,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		toolCalls := replyToolCalls(replies)
 		if !hasVisibleText(text) && len(toolCalls) == 0 {
 			errEmpty := fmt.Errorf("upstream returned no visible text or tool calls (completion_tokens=%d)", res.Usage.CompletionTokens)
-			logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
+			s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", errEmpty.Error())
 			return
 		}
@@ -290,7 +335,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if len(toolCalls) > 0 {
 			finish = "tool_calls"
 		}
-		logChatDone(id, startedAt, in, usedAccount, attempts, "ok", finish, res.Usage, len(toolCalls), nil)
+		s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "ok", finish, res.Usage, len(toolCalls), nil)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id":      id,
 			"object":  "chat.completion",
@@ -448,11 +493,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			case errors.Is(lastErr, ErrUserMessageTooLarge):
 				status, code = http.StatusBadRequest, "request_too_large"
 			}
-			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
+			s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
 			return
 		}
-		logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
+		s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
 		writeStreamError(lastErr.Error())
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
@@ -481,7 +526,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			finish = "tool_calls"
 		} else if !hasVisibleText(outText) {
 			errEmpty := fmt.Errorf("upstream returned no visible text or tool calls (completion_tokens=%d)", res.Usage.CompletionTokens)
-			logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
+			s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
 			writeStreamError(errEmpty.Error())
 			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 			flusher.Flush()
@@ -489,7 +534,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if !sawVisibleText {
 		errEmpty := fmt.Errorf("upstream returned no visible text (completion_tokens=%d)", res.Usage.CompletionTokens)
-		logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
+		s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
 		writeStreamError(errEmpty.Error())
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
@@ -510,7 +555,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}}}, nil)
 	}
 	writeChunk(map[string]any{}, finish)
-	logChatDone(id, startedAt, in, usedAccount, attempts, "ok", finish, res.Usage, len(outTools), nil)
+	s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "ok", finish, res.Usage, len(outTools), nil)
 	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
 		writePayload(map[string]any{
 			"id":      id,
@@ -542,19 +587,44 @@ func accountLogLabel(a *store.Account) string {
 }
 
 // logChatDone emits one completion line per chat request with the outcome,
-// selected account, mapped model, token usage, finish reason, and error.
-func logChatDone(id string, startedAt time.Time, in ChatInput, acct *store.Account, attempts int, status, finish string, u Usage, toolCalls int, err error) {
+// selected account, mapped model, token usage, finish reason, and error, and
+// keeps the same summary in memory for the management UI.
+func (s *Server) logChatDone(stream bool, id string, startedAt time.Time, in ChatInput, acct *store.Account, attempts int, status, finish string, u Usage, toolCalls int, err error) {
+	elapsed := time.Since(startedAt).Round(time.Millisecond)
 	if finish == "" {
 		finish = "-"
 	}
 	line := fmt.Sprintf("chat %s done status=%s account=%s model=%s attempts=%d elapsed=%s tokens{prompt=%d completion=%d total=%d cache_read=%d cache_write=%d} finish=%s tool_calls=%d",
-		id, status, accountLogLabel(acct), in.Model, attempts, time.Since(startedAt).Round(time.Millisecond),
+		id, status, accountLogLabel(acct), in.Model, attempts, elapsed,
 		u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.CacheReadTokens, u.CacheWriteTokens, finish, toolCalls)
+	errText := ""
 	if err != nil {
+		errText = err.Error()
 		log.Printf("%s error=%v", line, err)
-		return
+	} else {
+		log.Print(line)
 	}
-	log.Print(line)
+	record := ChatRecord{
+		ID:               id,
+		Time:             startedAt,
+		Model:            in.Model,
+		Status:           status,
+		Account:          accountLogLabel(acct),
+		Attempts:         attempts,
+		ElapsedMS:        elapsed.Milliseconds(),
+		Stream:           stream,
+		PromptChars:      len(in.Prompt),
+		SystemChars:      len(in.SystemPrompt),
+		PromptTokens:     u.PromptTokens,
+		CompletionTokens: u.CompletionTokens,
+		TotalTokens:      u.TotalTokens,
+		CacheReadTokens:  u.CacheReadTokens,
+		CacheWriteTokens: u.CacheWriteTokens,
+		Finish:           finish,
+		ToolCalls:        toolCalls,
+		Error:            errText,
+	}
+	s.records.add(record)
 }
 
 func (s *Server) maxAttempts(ctx context.Context) int {
