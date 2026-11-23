@@ -727,12 +727,18 @@ function renderProxies(data) {
     if (headerBox) headerBox.checked = false;
     updateProxySelection();
   };
-  $('#proxy-select-all').addEventListener('click', selectAll);
-  $('#proxy-clear-select').addEventListener('click', clearAll);
-  $('#proxy-test-selected').addEventListener('click', (event) => bulkProxyAction('test', event.currentTarget));
-  $('#proxy-enable-selected').addEventListener('click', (event) => bulkProxyAction('enable', event.currentTarget));
-  $('#proxy-disable-selected').addEventListener('click', (event) => bulkProxyAction('disable', event.currentTarget));
-  $('#proxy-delete-selected').addEventListener('click', (event) => bulkProxyAction('delete', event.currentTarget));
+  // The bulk toolbar only exists while the pool has rows; bind defensively so
+  // an empty pool still renders instead of failing on a missing element.
+  const onBulk = (id, handler) => {
+    const button = $(id);
+    if (button) button.addEventListener('click', handler);
+  };
+  onBulk('#proxy-select-all', selectAll);
+  onBulk('#proxy-clear-select', clearAll);
+  onBulk('#proxy-test-selected', (event) => bulkProxyAction('test', event.currentTarget));
+  onBulk('#proxy-enable-selected', (event) => bulkProxyAction('enable', event.currentTarget));
+  onBulk('#proxy-disable-selected', (event) => bulkProxyAction('disable', event.currentTarget));
+  onBulk('#proxy-delete-selected', (event) => bulkProxyAction('delete', event.currentTarget));
   updateProxySelection();
 }
 
