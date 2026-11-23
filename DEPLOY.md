@@ -325,6 +325,9 @@ docker compose run --rm -it quickproxy login -manual
 ./bin/quickproxy logout -account 1
 ./bin/quickproxy logout -all
 ./bin/quickproxy passwd -password '新密码'   # 写 webui.password_hash，清空明文密码
+./bin/quickproxy export -out accounts.json   # 导出全部账号（含 token，注意保管）
+./bin/quickproxy import -in accounts.json    # 增量导入：已存在的账号跳过
+./bin/quickproxy import -in accounts.json -update  # 同时更新已存在账号的 token
 ```
 
 ## 10. 常见坑

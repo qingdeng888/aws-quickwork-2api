@@ -229,7 +229,7 @@ ON CONFLICT(email, tenant_url) DO UPDATE SET
 	expires_at=excluded.expires_at,
 	obtained_at=excluded.obtained_at,
 	updated_at=excluded.updated_at,
-	disabled=0,
+	disabled=accounts.disabled,
 	last_error=''
 RETURNING id`
 	err := s.db.QueryRowContext(ctx, q,
