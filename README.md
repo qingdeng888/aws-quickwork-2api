@@ -8,7 +8,8 @@
 
 ## 功能
 
-- `POST /v1/chat/completions`，支持流式（SSE）与非流式响应
+- `POST /v1/chat/completions`（OpenAI Chat Completions）、`POST /v1/responses`（OpenAI Responses API）、`POST /v1/messages`（Anthropic Messages API），三者都支持流式（SSE）与非流式响应，共用同一套账号轮询、token 刷新、会话复用与工具桥接
+- `POST /v1/messages/count_tokens`（Anthropic 客户端预检用，返回估算值）
 - `GET /v1/models`，返回本地模型别名
 - 原生 social 登录（AWS IAM Identity Center OIDC）与企业 OIDC 登录，使用 PKCE
 - 支持服务器/远程登录：手动粘贴浏览器 callback URL，无需开放本地回调端口
@@ -128,6 +129,54 @@ for chunk in client.chat.completions.create(
 ):
     print(chunk.choices[0].delta.content or "", end="")
 ```
+
+### 5. 其它接口（Responses / Anthropic）
+
+有些 agent 只认 OpenAI Responses API 或 Anthropic Messages API，这两个入口也直接可用，内部会转换成同一条上游链路。
+
+```bash
+# OpenAI Responses API
+curl http://127.0.0.1:8080/v1/responses \
+  -H "Authorization: Bearer local" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"smart","input":"hello"}'
+```
+
+```python
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="local")
+resp = client.responses.create(model="smart", input="hello")
+print(resp.output_text)
+```
+
+```bash
+# Anthropic Messages API
+curl http://127.0.0.1:8080/v1/messages \
+  -H "Authorization: Bearer local" \
+  -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"smart","max_tokens":256,"messages":[{"role":"user","content":"hello"}]}'
+```
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(base_url="http://127.0.0.1:8080", api_key="local")
+msg = client.messages.create(model="smart", max_tokens=256,
+                             messages=[{"role": "user", "content": "hello"}])
+print(msg.content[0].text)
+```
+
+映射说明：
+
+| 调用方字段 | 内部处理 |
+|---|---|
+| Responses `input`（字符串或 items 数组）、`instructions` | 转成 chat 的 `messages`；`function_call` / `function_call_output` items 转成工具调用与工具结果 |
+| Anthropic `system`（字符串或 blocks）、`messages` | 同上；`tool_use` 转成 assistant 工具调用，`tool_result` 转成 `role=tool` 消息 |
+| 两边的 `tools` | 转成 OpenAI tools 后走同一套工具桥接；Responses 的内置工具（web_search 等）和 Anthropic 的 server 工具会被忽略 |
+| `tool_choice` | Anthropic `any` → `required`，`tool` → 指定函数；Responses 的 `{"type":"function","name":...}` → 指定函数 |
+| 流式输出 | 分别输出 Responses 的 `response.*` 事件和 Anthropic 的 `message_start` / `content_block_*` / `message_delta` / `message_stop` 事件 |
+
+不支持的状态字段（`previous_response_id`、`store`、`max_output_tokens`、`temperature` 等）会被忽略：上下文由请求里的完整历史决定，和 chat 接口保持一致。
 
 ## 配置 `config.json`
 

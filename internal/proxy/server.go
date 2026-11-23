@@ -1,10 +1,12 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -64,6 +66,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChat)
+	mux.HandleFunc("/v1/responses", s.handleResponses)
+	mux.HandleFunc("/v1/messages", s.handleMessages)
+	mux.HandleFunc("/v1/messages/count_tokens", s.handleCountTokens)
 	if s.adminHandler != nil {
 		prefix := s.adminPrefix
 		if prefix == "" {
@@ -145,39 +150,120 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
-func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+// readAPIRequest performs the checks shared by every OpenAI-style endpoint and
+// returns the request body. Errors are written in the caller's dialect.
+func (s *Server) readAPIRequest(w http.ResponseWriter, r *http.Request, flavor wireFlavor) ([]byte, bool) {
 	if r.Method != http.MethodPost {
-		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "POST required")
-		return
+		writeFlavorError(w, flavor, http.StatusMethodNotAllowed, "method_not_allowed", "POST required")
+		return nil, false
 	}
 	if !s.tokens.Load().Allowed(r) && !adminAuthenticated(r) {
-		writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "invalid proxy API key")
-		return
+		writeFlavorError(w, flavor, http.StatusUnauthorized, "invalid_api_key", "invalid proxy API key")
+		return nil, false
 	}
-
-	var req ChatRequest
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20))
-	if err := dec.Decode(&req); err != nil {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<20))
+	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
-			writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds the size limit")
-			return
+			writeFlavorError(w, flavor, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds the size limit")
+			return nil, false
 		}
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON body: "+err.Error())
+		writeFlavorError(w, flavor, http.StatusBadRequest, "invalid_request_error", "could not read request body: "+err.Error())
+		return nil, false
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		writeFlavorError(w, flavor, http.StatusBadRequest, "invalid_request_error", "request body is empty")
+		return nil, false
+	}
+	return body, true
+}
+
+// decodeChatBody parses an OpenAI chat completions body.
+func decodeChatBody(body []byte) (*ChatRequest, error) {
+	var req ChatRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, err
+	}
+	return &req, nil
+}
+
+// handleChat serves POST /v1/chat/completions.
+func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+	body, ok := s.readAPIRequest(w, r, wireChat)
+	if !ok {
+		return
+	}
+	req, err := decodeChatBody(body)
+	if err != nil {
+		writeFlavorError(w, wireChat, http.StatusBadRequest, "invalid_request_error", "invalid JSON body: "+err.Error())
 		return
 	}
 	if req.N > 1 {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "n > 1 is not supported")
+		writeFlavorError(w, wireChat, http.StatusBadRequest, "invalid_request_error", "n > 1 is not supported")
 		return
 	}
+	s.serveChat(w, r, wireChat, req)
+}
 
+// handleResponses serves POST /v1/responses (OpenAI Responses API).
+func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
+	body, ok := s.readAPIRequest(w, r, wireResponses)
+	if !ok {
+		return
+	}
+	req, err := chatFromResponses(body)
+	if err != nil {
+		writeFlavorError(w, wireResponses, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	s.serveChat(w, r, wireResponses, req)
+}
+
+// handleMessages serves POST /v1/messages (Anthropic Messages API).
+func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
+	body, ok := s.readAPIRequest(w, r, wireAnthropic)
+	if !ok {
+		return
+	}
+	req, err := chatFromAnthropic(body)
+	if err != nil {
+		writeFlavorError(w, wireAnthropic, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	s.serveChat(w, r, wireAnthropic, req)
+}
+
+// handleCountTokens serves POST /v1/messages/count_tokens. Anthropic clients
+// call it before large requests; the figure is an estimate because the
+// upstream does not expose a tokenizer.
+func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
+	body, ok := s.readAPIRequest(w, r, wireAnthropic)
+	if !ok {
+		return
+	}
+	req, err := chatFromAnthropic(body)
+	if err != nil {
+		writeFlavorError(w, wireAnthropic, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
 	prompt, err := formatPrompt(req.Messages)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		writeFlavorError(w, wireAnthropic, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"input_tokens": estimateTokens(prompt)})
+}
+
+// serveChat runs one chat request through the upstream pipeline and renders the
+// answer in the dialect selected by flavor.
+func (s *Server) serveChat(w http.ResponseWriter, r *http.Request, flavor wireFlavor, req *ChatRequest) {
+	prompt, err := formatPrompt(req.Messages)
+	if err != nil {
+		writeFlavorError(w, flavor, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 	model := s.mapModel(req.Model)
-	allowedTools := requestedToolNames(&req)
+	allowedTools := requestedToolNames(req)
 	choiceMode, choiceName := parseToolChoice(req.ToolChoice)
 	if choiceMode == "function" && choiceName != "" {
 		allowedTools[choiceName] = true
@@ -186,7 +272,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if req.ParallelToolCalls != nil {
 		parallelTools = *req.ParallelToolCalls
 	}
-	bridgePrompt := buildToolBridgePrompt(&req, choiceMode, choiceName, parallelTools)
+	bridgePrompt := buildToolBridgePrompt(req, choiceMode, choiceName, parallelTools)
 	bridgeActive := bridgePrompt != ""
 	systemPromptText := systemPrompt(req.Messages, bridgePrompt)
 	// QuickWork has no per-turn system prompt channel, so the caller's
@@ -197,9 +283,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		instructions = systemPromptText
 	}
 
-	conv, err := s.sessions.acquire(r.Context(), conversationKey(r, &req, systemPromptText))
+	conv, err := s.sessions.acquire(r.Context(), conversationKey(r, req, systemPromptText))
 	if err != nil {
-		writeOpenAIError(w, http.StatusServiceUnavailable, "request_cancelled", "request ended while waiting for the conversation: "+err.Error())
+		writeFlavorError(w, flavor, http.StatusServiceUnavailable, "request_cancelled", "request ended while waiting for the conversation: "+err.Error())
 		return
 	}
 	defer s.sessions.release(conv)
@@ -219,8 +305,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	threadID := strings.TrimSpace(r.Header.Get("X-Thread-Id"))
-	id := "chatcmpl-" + strings.ReplaceAll(uuid(), "-", "")
+	id := flavor.idPrefix() + strings.ReplaceAll(uuid(), "-", "")
 	created := time.Now().Unix()
+	// Responses and Messages echo the model the caller asked for.
+	outModel := model
+	if flavor != wireChat {
+		if requested := strings.TrimSpace(req.Model); requested != "" {
+			outModel = requested
+		}
+	}
 	in := ChatInput{
 		Prompt:        promptText,
 		Model:         model,
@@ -335,7 +428,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				status, code = http.StatusBadRequest, "request_too_large"
 			}
 			s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
-			writeOpenAIError(w, status, code, lastErr.Error())
+			writeFlavorError(w, flavor, status, code, lastErr.Error())
 			return
 		}
 		if s.cfg.SessionReuse && res.ThreadID != "" {
@@ -357,134 +450,39 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if !hasVisibleText(text) && len(toolCalls) == 0 {
 			errEmpty := fmt.Errorf("upstream returned no visible text or tool calls (completion_tokens=%d)", res.Usage.CompletionTokens)
 			s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", errEmpty.Error())
+			writeFlavorError(w, flavor, http.StatusBadGateway, "upstream_error", errEmpty.Error())
 			return
-		}
-		message := map[string]any{"role": "assistant"}
-		if !hasVisibleText(text) {
-			message["content"] = nil
-		} else {
-			message["content"] = text
-		}
-		if len(toolCalls) > 0 {
-			message["tool_calls"] = toolCalls
 		}
 		finish := "stop"
 		if len(toolCalls) > 0 {
 			finish = "tool_calls"
 		}
 		s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "ok", finish, res.Usage, len(toolCalls), nil)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"id":      id,
-			"object":  "chat.completion",
-			"created": created,
-			"model":   model,
-			"choices": []map[string]any{{
-				"index":         0,
-				"message":       message,
-				"finish_reason": finish,
-			}},
-			"usage": usageMap(res.Usage),
-		})
+		writeFlavorCompletion(w, flavor, id, created, outModel, text, toolCalls, finish, res.Usage)
 		return
 	}
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeOpenAIError(w, http.StatusInternalServerError, "streaming_unavailable", "response writer does not support flushing")
+	if _, ok := w.(http.Flusher); !ok {
+		writeFlavorError(w, flavor, http.StatusInternalServerError, "streaming_unavailable", "response writer does not support flushing")
 		return
 	}
-	// started means the role chunk (real content) reached the client, so a
-	// retry is no longer possible. headersSent only means the SSE response
-	// began, e.g. for keep-alive comments while the tool bridge buffers.
-	started := false
-	headersSent := false
-	var writeMu sync.Mutex
-	writeLine := func(s string) {
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		_, _ = fmt.Fprint(w, s)
-		flusher.Flush()
-	}
-	writeRaw := func(payload map[string]any) {
-		body, _ := json.Marshal(payload)
-		writeLine("data: " + string(body) + "\n\n")
-	}
-	sendHeaders := func() {
-		if headersSent {
-			return
-		}
-		headersSent = true
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
-		if threadID != "" {
-			w.Header().Set("X-Thread-Id", threadID)
-		}
-		w.WriteHeader(http.StatusOK)
-		flusher.Flush()
-	}
-	ensureStarted := func() {
-		if started {
-			return
-		}
-		started = true
-		sendHeaders()
-		writeRaw(map[string]any{
-			"id":      id,
-			"object":  "chat.completion.chunk",
-			"created": created,
-			"model":   model,
-			"choices": []map[string]any{{
-				"index":         0,
-				"delta":         map[string]any{"role": "assistant"},
-				"finish_reason": nil,
-			}},
-		})
-	}
-	writePayload := func(payload map[string]any) {
-		ensureStarted()
-		writeRaw(payload)
-	}
-	writeChunk := func(delta map[string]any, finish any) {
-		writePayload(map[string]any{
-			"id":      id,
-			"object":  "chat.completion.chunk",
-			"created": created,
-			"model":   model,
-			"choices": []map[string]any{{
-				"index":         0,
-				"delta":         delta,
-				"finish_reason": finish,
-			}},
-		})
-	}
-	// writeStreamError ends a stream consistently: if a role chunk was sent,
-	// close the choice with finish_reason "stop", then emit the error object
-	// and [DONE].
-	writeStreamError := func(message string) {
-		if started {
-			writeChunk(map[string]any{}, "stop")
-		}
-		sendHeaders()
-		writeRaw(map[string]any{"error": map[string]any{
-			"message": message,
-			"type":    "upstream_error",
-			"code":    "upstream_error",
-		}})
-		writeLine("data: [DONE]\n\n")
-	}
+	// The stream writer owns the SSE headers and the two flags that decide
+	// whether a retry is still safe: started means real content reached the
+	// client, headersSent only means the response began (keep-alive comments
+	// while the tool bridge buffers still allow a retry).
+	sw := newStreamWriter(w, flavor, id, outModel, created,
+		flavor == wireChat && req.StreamOptions != nil && req.StreamOptions.IncludeUsage)
+	sw.threadID = threadID
 
 	sawVisibleText := false
 	var bridgeBuffer strings.Builder
 
 	// While the tool bridge buffers the whole answer, keep idle proxies and
-	// clients from timing out with SSE comments. Only headers and comments
-	// are sent, never the role chunk, so failed attempts can still retry.
+	// clients from timing out. Only headers and comments are sent, never the
+	// role chunk, so failed attempts can still retry.
 	stopHeartbeat := func() {}
 	if bridgeActive {
-		sendHeaders()
+		sw.sendHeaders()
 		hbDone := make(chan struct{})
 		hbExited := make(chan struct{})
 		go func() {
@@ -498,7 +496,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					writeLine(": keep-alive\n\n")
+					sw.keepAlive()
 				}
 			}
 		}()
@@ -550,7 +548,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				if hasVisibleText(ev.Text) {
 					sawVisibleText = true
 				}
-				writeChunk(map[string]any{"content": ev.Text}, nil)
+				sw.textDelta(ev.Text)
 			}
 			return nil
 		})
@@ -567,7 +565,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, ErrUserMessageTooLarge) {
 			break
 		}
-		if resume && !started {
+		if resume && !sw.started {
 			conv.reset()
 			resume = false
 			in.ThreadID = ""
@@ -578,8 +576,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			log.Printf("chat %s session resume failed; retrying with full transcript", id)
 			continue
 		}
-		if started || ctx.Err() != nil {
-			if started {
+		if sw.started || ctx.Err() != nil {
+			if sw.started {
 				log.Printf("chat %s stream already started; not retrying", id)
 			}
 			break
@@ -594,7 +592,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		conv.reset()
 		// Once heartbeat headers are out, a JSON error status is no longer
 		// possible; fall through to the in-stream error instead.
-		if !started && !headersSent {
+		if !sw.started && !sw.headersSent {
 			status, code := http.StatusBadGateway, "upstream_error"
 			switch {
 			case errors.Is(lastErr, accounts.ErrNoAccounts):
@@ -603,11 +601,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				status, code = http.StatusBadRequest, "request_too_large"
 			}
 			s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
-			writeOpenAIError(w, status, code, lastErr.Error())
+			writeFlavorError(w, flavor, status, code, lastErr.Error())
 			return
 		}
 		s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
-		writeStreamError(lastErr.Error())
+		sw.streamError(lastErr.Error())
 		return
 	}
 	if s.cfg.SessionReuse && res.ThreadID != "" {
@@ -634,7 +632,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		} else if !hasVisibleText(outText) {
 			errEmpty := fmt.Errorf("upstream returned no visible text or tool calls (completion_tokens=%d)", res.Usage.CompletionTokens)
 			s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
-			writeStreamError(errEmpty.Error())
+			sw.streamError(errEmpty.Error())
 			return
 		}
 	} else if !sawVisibleText {
@@ -645,37 +643,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		errEmpty := fmt.Errorf("upstream returned no visible text (completion_tokens=%d)", res.Usage.CompletionTokens)
 		s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
-		writeStreamError(errEmpty.Error())
+		sw.streamError(errEmpty.Error())
 		return
 	}
 	if hasVisibleText(outText) {
-		writeChunk(map[string]any{"content": outText}, nil)
+		sw.textDelta(outText)
 	}
-	for i, tc := range outTools {
-		writeChunk(map[string]any{"tool_calls": []map[string]any{{
-			"index": i,
-			"id":    tc.ID,
-			"type":  "function",
-			"function": map[string]any{
-				"name":      tc.Function.Name,
-				"arguments": tc.Function.Arguments,
-			},
-		}}}, nil)
-	}
-	writeChunk(map[string]any{}, finish)
+	sw.toolCalls(outTools)
+	sw.finish(finish, res.Usage)
 	s.logChatDone(req.Stream, id, startedAt, in, usedAccount, attempts, "ok", finish, res.Usage, len(outTools), nil)
-	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
-		writePayload(map[string]any{
-			"id":      id,
-			"object":  "chat.completion.chunk",
-			"created": created,
-			"model":   model,
-			"choices": []any{},
-			"usage":   usageMap(res.Usage),
-		})
-	}
-	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-	flusher.Flush()
+	sw.done()
 }
 
 // proxyLogLabel keeps credentials out of request logs.
