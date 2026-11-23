@@ -2,6 +2,7 @@ package admin
 
 import (
 	"crypto/tls"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
@@ -79,5 +80,43 @@ func TestLoginCheckPerIPCap(t *testing.T) {
 	s.releaseLoginCheck("1.2.3.4")
 	if !s.acquireLoginCheck(ctx, "1.2.3.4") {
 		t.Fatal("slot should be free after release")
+	}
+}
+
+func TestOriginAllowedBehindProxy(t *testing.T) {
+	req := func(host, forwardedHost, forwardedProto string, withTLS bool) *http.Request {
+		r := &http.Request{Host: host, Header: http.Header{}}
+		if forwardedHost != "" {
+			r.Header.Set("X-Forwarded-Host", forwardedHost)
+		}
+		if forwardedProto != "" {
+			r.Header.Set("X-Forwarded-Proto", forwardedProto)
+		}
+		if withTLS {
+			r.TLS = &tls.ConnectionState{}
+		}
+		return r
+	}
+
+	// The exact case from a Cloudflare + nginx deployment: nginx forwards
+	// X-Forwarded-Proto https, the browser sends an https Origin.
+	if !originAllowed(req("aws.example.com", "", "https", false), "https://aws.example.com", true) {
+		t.Fatal("https origin should pass when trust_proxy is on")
+	}
+	// Without trust_proxy the forwarded protocol is ignored, so the check
+	// fails and the log explains why. That is the expected secure default.
+	if originAllowed(req("aws.example.com", "", "https", false), "https://aws.example.com", false) {
+		t.Fatal("forwarded proto must be ignored without trust_proxy")
+	}
+	// A proxy that rewrites Host still passes through X-Forwarded-Host.
+	if !originAllowed(req("127.0.0.1:18099", "aws.example.com", "https", false), "https://aws.example.com", true) {
+		t.Fatal("x-forwarded-host should be accepted with trust_proxy")
+	}
+	if originAllowed(req("127.0.0.1:18099", "aws.example.com", "https", false), "https://evil.example.com", true) {
+		t.Fatal("a foreign origin must be rejected")
+	}
+	// Direct TLS keeps working without any proxy headers.
+	if !originAllowed(req("aws.example.com", "", "", true), "https://aws.example.com", false) {
+		t.Fatal("direct TLS origin should pass")
 	}
 }

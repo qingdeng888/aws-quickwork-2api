@@ -373,7 +373,22 @@ func originAllowed(r *http.Request, origin string, trustProxy bool) bool {
 	if err != nil || parsed.Host == "" {
 		return false
 	}
-	if !strings.EqualFold(parsed.Host, r.Host) {
+	// Behind a reverse proxy the Host header may have been rewritten; the
+	// forwarded host is the public name the browser used.
+	hosts := []string{r.Host}
+	if trustProxy {
+		if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Host")); forwarded != "" {
+			hosts = append(hosts, forwarded)
+		}
+	}
+	hostOK := false
+	for _, host := range hosts {
+		if strings.EqualFold(parsed.Host, strings.TrimSpace(host)) {
+			hostOK = true
+			break
+		}
+	}
+	if !hostOK {
 		return false
 	}
 	scheme := "http"

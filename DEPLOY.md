@@ -173,12 +173,40 @@ Nginx：
 location / {
     proxy_pass http://127.0.0.1:8080;
     proxy_http_version 1.1;
-    proxy_set_header Connection "";
+    proxy_set_header Host $host;                       # 管理后台的 Origin 校验依赖它
+    proxy_set_header X-Forwarded-Proto $scheme;        # 让后台知道外面是 https
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
     proxy_buffering off;        # 流式响应必需
+    proxy_cache off;
     proxy_read_timeout 600s;    # 上游 request_timeout 默认 5m
     proxy_set_header Authorization $http_authorization;
 }
 ```
+
+### 反代 / Cloudflare 下打开 `/admin`
+
+浏览器访问 `https://你的域名/admin/`，登录后点任何写操作（包括 Playground）报
+`request origin does not match this server`，是因为管理后台会校验 `Origin` 的协议与
+Host：默认只看直连 TLS，反代终止 TLS 时请求在进程内是 http，就会判定不一致。
+
+打开信任反代头即可（只在你确实部署在反代后面时开启，否则客户端可以伪造这些头）：
+
+```bash
+# .env（Docker）
+WEBUI_TRUST_PROXY=true
+# 或 config.json
+{ "webui": { "trust_proxy": true } }
+```
+
+开启后，后台用 `X-Forwarded-Proto` 判定 https、用 `X-Forwarded-For` 取客户端 IP
+（登录限速按它计数），同时接受 `X-Forwarded-Host` 作为公开域名。反代必须像上面那样
+传递这几个头；Cloudflare 侧保持 SSL 模式 `Full (strict)`，WebSocket 与 SSE 默认可透传。
+
+如果日志里出现 `origin check failed`，会同时打印一行 `hint: ... set WEBUI_TRUST_PROXY=true`，
+说明就是这种情况（日志同时给出实际收到的 Origin、Host、协议和转发头）。
 
 客户端配置：
 

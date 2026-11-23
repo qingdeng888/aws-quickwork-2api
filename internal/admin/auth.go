@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -164,6 +165,16 @@ func (s *Server) csrf(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		if origin := r.Header.Get("Origin"); origin != "" && !originAllowed(r, origin, s.webui().TrustProxy) {
+			scheme := "http"
+			if requestIsSecure(r, s.webui().TrustProxy) {
+				scheme = "https"
+			}
+			s.logger.Printf("origin check failed: origin=%q host=%q scheme=%s trust_proxy=%v x-forwarded-host=%q x-forwarded-proto=%q",
+				origin, r.Host, scheme, s.webui().TrustProxy,
+				r.Header.Get("X-Forwarded-Host"), r.Header.Get("X-Forwarded-Proto"))
+			if !s.webui().TrustProxy && strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https") {
+				s.logger.Printf("hint: this request arrived through an HTTPS reverse proxy; set WEBUI_TRUST_PROXY=true (or webui.trust_proxy) to accept its forwarded protocol")
+			}
 			writeError(w, http.StatusForbidden, "origin_failed", "request origin does not match this server")
 			return
 		}

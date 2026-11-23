@@ -440,6 +440,7 @@ chat chatcmpl-... done status=ok account=1:social:user@example.com model=smart a
 | `/admin` 返回 503 `admin_disabled` | 还没设置管理密码：`quickproxy passwd -password '...'` 或写 `webui.password`，然后重启 |
 | `/admin` 登录一直提示密码错误 | 确认改的是当前 `-config` 指向的那份 `config.json`；`webui.password_hash` 存在时会忽略 `webui.password` |
 | `/admin` 提示 429 | 5 分钟内失败次数超过 `webui.max_attempts`；等待窗口过期，或调大该值 |
+| 反代/Cloudflare 下后台报 `request origin does not match this server` | 设置 `WEBUI_TRUST_PROXY=true`（或 `webui.trust_proxy`），详情见 [DEPLOY.md](DEPLOY.md#反代--cloudflare-下打开-admin) |
 | 网页里点「开始登录」后本机模式一直等待 | 浏览器必须能访问服务器的 `127.0.0.1:<callback_port>`；远程用「手动回填」模式 |
 | 配置页保存后提示「等待重启」 | `webui` 之外的字段只在下次启动生效，重启 `quickproxy server` 即可 |
 | `docker compose up` 报 `env file .env not found` | 先 `cp .env.example .env`，compose 默认从这个文件读取变量 |
