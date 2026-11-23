@@ -15,9 +15,12 @@ CONFIG_DIR="$(dirname "$CONFIG")"
 
 mkdir -p "$DATA_DIR" "$CONFIG_DIR"
 
-if [ ! -w "$CONFIG_DIR" ]; then
-  echo "[entrypoint] warning: $CONFIG_DIR is not writable by uid $(id -u); /admin config saves will fail" >&2
+if ! touch "$CONFIG_DIR/.write-test" 2>/dev/null; then
+  echo "[entrypoint] ERROR: $CONFIG_DIR is not writable by uid $(id -u)." >&2
+  echo "[entrypoint] On Linux bind mounts run: sudo chown -R 10001:10001 <host data dir>" >&2
+  exit 1
 fi
+rm -f "$CONFIG_DIR/.write-test"
 
 case "$(printf '%s' "${CONFIG_FROM_ENV:-true}" | tr '[:upper:]' '[:lower:]')" in
   1|true|yes|on)

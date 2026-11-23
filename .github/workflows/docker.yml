@@ -101,10 +101,27 @@ jobs:
             -e TIMEZONE=UTC \
             aws-quickwork-2api:ci
 
-          for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:18080/healthz >/dev/null 2>&1; then break; fi
+          ready=false
+          for _ in $(seq 1 40); do
+            if [ "$(docker inspect -f '{{.State.Running}}' qw 2>/dev/null)" != "true" ]; then
+              echo "container stopped before becoming ready"
+              docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}' qw || true
+              docker logs qw || true
+              exit 1
+            fi
+            if curl -fsS http://127.0.0.1:18080/healthz >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
             sleep 1
           done
+          if [ "$ready" != "true" ]; then
+            echo "healthz never answered; container state:"
+            docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}}' qw || true
+            docker port qw || true
+            docker logs qw || true
+            exit 1
+          fi
 
           echo "== healthz"
           curl -fsS http://127.0.0.1:18080/healthz; echo
@@ -133,7 +150,27 @@ jobs:
 
       - name: Container logs
         if: failure()
-        run: docker logs qw || true
+        run: docker logs --tail 80 qw || true
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          set +e
+          echo "--- docker ps"; docker ps -a
+          echo "--- inspect"; docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}' qw
+          echo "--- logs"; docker logs --tail 60 qw
+          echo "--- filesystem"; docker exec qw sh -c 'id; ls -la /app /app/data'
+          echo "--- binary"; docker exec qw /app/quickproxy help
+          echo "--- config"; docker exec qw cat /app/data/config.json
+
+          # Publish a compact copy as an annotation so it is readable from the
+          # API even when the raw job log is not available.
+          message=$( {
+              docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}}' qw 2>&1
+              docker logs --tail 25 qw 2>&1
+              docker exec qw sh -c 'ls -la /app/data' 2>&1
+            } | sed 's/%/%25/g; s/\r//g' | awk 'NF {printf "%s%%0A", $0}' )
+          echo "::error title=container diagnostics::$message"
 
       - name: Cleanup
         if: always()
