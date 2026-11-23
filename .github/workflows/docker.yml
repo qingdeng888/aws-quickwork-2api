@@ -148,6 +148,36 @@ jobs:
           docker exec qw sh -c 'test -f /app/data/quickwork.db'
           echo "== smoke test passed"
 
+      - name: Bind mount from a root-owned directory
+        run: |
+          set -euo pipefail
+          sudo rm -rf /tmp/qwdata
+          sudo mkdir -p /tmp/qwdata
+          sudo chown 0:0 /tmp/qwdata
+          sudo chmod 0755 /tmp/qwdata
+
+          docker run -d --name qw-bind -p 18081:8080 -v /tmp/qwdata:/app/data \
+            -e WEBUI_PASSWORD=ci-password-123 \
+            aws-quickwork-2api:ci
+
+          ok=false
+          for _ in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:18081/healthz >/dev/null 2>&1; then
+              ok=true
+              break
+            fi
+            sleep 1
+          done
+
+          docker logs qw-bind
+          test "$ok" = "true"
+          echo "== host directory after startup (expect uid 10001)"
+          sudo ls -ln /tmp/qwdata
+          sudo test -f /tmp/qwdata/quickwork.db
+          test "$(sudo stat -c %u /tmp/qwdata/config.json)" = "10001"
+          docker rm -f qw-bind
+          echo "== bind mount smoke test passed"
+
       - name: Container logs
         if: failure()
         run: docker logs --tail 80 qw || true
@@ -174,4 +204,6 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: docker rm -f qw || true
+        run: |
+          docker rm -f qw || true
+          docker rm -f qw-bind || true

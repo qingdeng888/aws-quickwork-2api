@@ -246,11 +246,9 @@ docker compose logs -f
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
-数据只有一处：`./data` 目录里的 `config.json` + `quickwork.db`。Linux 上它由容器内 uid 10001 写入：
+数据只有一处：`./data` 目录里的 `config.json` + `quickwork.db`。
 
-```bash
-sudo chown -R 10001:10001 ./data
-```
+**不需要手动 chown**：容器入口以 root 启动，检测到 `./data` 不属于运行用户时先 `chown -R 10001:10001`，随后立即降权到 uid 10001 再渲染配置和启动服务（应用进程始终不是 root）。只有你在 compose 里显式写了 `user: "10001:10001"` 时，入口拿不到 root，才需要预先 `sudo chown -R 10001:10001 ./data`。
 
 #### 环境变量如何生效
 
@@ -341,6 +339,6 @@ docker compose run --rm -it quickproxy login -manual
 - **模型自称 AWS Quick / 不听话**：内置 agent 提示词在服务端，换 `chat_agent_id` 才能真正替换。
 - **`/admin` 503 `admin_disabled`**：没设管理密码，`quickproxy passwd -password '...'` 或写 `webui.password`，然后重启。
 - **`/admin` 登录 429**：5 分钟内失败超过 `webui.max_attempts`；等窗口过期或调大该值。挂反代时所有请求都算代理 IP，必要时开 `webui.trust_proxy`。
-- **配置页保存报 `permission denied`**：运行用户对 `config.json` 没有写权限（Docker 常见，见上面的 `chown 10001`）。
+- **配置页保存报 `permission denied`**：运行用户对 `config.json` 没有写权限。默认镜像会在启动时自动修正 `./data` 属主；只在你自己加了 `user:` 或改了挂载路径时才需要 `chown 10001`。
 - **改了配置但行为没变**：只有 `webui` 段即时生效，其它字段要重启进程。
 - **备份**：只需备份 `config.json` + `data/quickwork.db`，且两者都含密钥，别进 git（`.gitignore` 已排除）。

@@ -26,7 +26,8 @@ LABEL org.opencontainers.image.title="aws-quickwork-2api" \
 
 # ca-certificates: TLS to the upstream and OIDC endpoints.
 # tzdata: config.json "timezone" is validated against the IANA database.
-RUN apk add --no-cache ca-certificates tzdata \
+# su-exec: drop from root to the runtime user after fixing data ownership.
+RUN apk add --no-cache ca-certificates tzdata su-exec \
  && adduser -D -u 10001 -h /app qw \
  && mkdir -p /app/data \
  && chown -R qw:qw /app
@@ -39,15 +40,15 @@ RUN chmod 0755 /usr/local/bin/entrypoint.sh \
  && sed -i 's/\r$//' /usr/local/bin/entrypoint.sh \
  && test "$(head -c 2 /usr/local/bin/entrypoint.sh)" = '#!'
 
-USER qw
-
-# The container must listen on a routable address; 127.0.0.1 would make the
-# published port unreachable. Override ADDR only if you also change the port
-# mapping and the health check.
+# The entrypoint starts as root to chown a bind-mounted /app/data, then drops to
+# uid 10001 (APP_UID) before rendering config.json or starting the server. The
+# application itself never runs as root.
 ENV CONFIG_PATH=/app/data/config.json \
     DATA_DIR=/app/data \
     DATABASE=/app/data/quickwork.db \
     ADDR=0.0.0.0:8080 \
+    APP_UID=10001 \
+    APP_GID=10001 \
     QW_CONTAINER=1 \
     TZ=UTC
 

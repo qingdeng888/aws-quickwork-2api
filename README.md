@@ -305,7 +305,7 @@ docker compose up -d
 | `.env.example` | 端口、管理密码、API key、OAuth 与模型等变量模板 |
 | `.github/workflows/docker.yml` | push `main` / 打 `v*` tag 构建 amd64+arm64 推到 GHCR，并对 amd64 镜像做冒烟测试 |
 
-- 所有持久化数据都在 `./data`：`config.json` + `quickwork.db`。Linux 上先 `sudo chown -R 10001:10001 ./data`。
+- 所有持久化数据都在 `./data`：`config.json` + `quickwork.db`。入口脚本会以 root 修正该目录属主后立刻降权到 uid 10001，正常部署不需要手动 `chown`；只有显式配置了 `user:` 时才需要预先授权。
 - `.env` 的变量每次启动都会合并进 `config.json`（空值不覆盖）；`CONFIG_FROM_ENV=false` 可关闭。密码想以 `/admin` 修改为准，就把 `WEBUI_PASSWORD` 留空或改用 `WEBUI_PASSWORD_HASH`。
 - 宿主机浏览器无法回调容器里的 `127.0.0.1:18080`，容器内请在 `/admin` → 登录上游 用「手动回填 callback URL」，或执行 `docker compose run --rm -it quickproxy login -manual`。
 - 环境变量与配置字段的完整对照见 [DEPLOY.md](DEPLOY.md#6-常驻运行)。
@@ -436,7 +436,7 @@ chat chatcmpl-... done status=ok account=1:social:user@example.com model=smart a
 | `docker compose up` 报 `env file .env not found` | 先 `cp .env.example .env`，compose 默认从这个文件读取变量 |
 | `docker compose pull` 报 `unauthorized` / `denied` | GHCR 包默认私有：在 GitHub 的 package 设置里改成 public，或先 `docker login ghcr.io` |
 | 容器起来了但 `/admin` 返回 503 | `.env` 里 `WEBUI_PASSWORD` 为空；填一个至少 8 位的密码后 `docker compose up -d` |
-| Linux 上容器报 `permission denied` 写 `/app/data` | 绑定目录归宿主用户所有，先 `sudo chown -R 10001:10001 ./data` |
+| Linux 上容器报 `permission denied` 写 `/app/data` | 镜像会自动修正属主；如果你在 compose 里写了 `user:`，改为预先 `sudo chown -R 10001:10001 ./data` 或去掉 `user:` |
 
 ## 目录
 

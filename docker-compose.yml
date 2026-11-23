@@ -24,9 +24,13 @@ services:
       - "${WEB_PORT:-8080}:8080"
     volumes:
       # config.json and quickwork.db both live here: back up this one directory.
+      # The entrypoint fixes its ownership as root on start, then drops to
+      # uid 10001 before running the server, so no manual chown is needed.
       - ./data:/app/data
     security_opt:
       - no-new-privileges:true
+    # Leave `user:` unset: the entrypoint needs root for one chown of ./data,
+    # then drops to uid 10001 (APP_UID) before starting the server.
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
       interval: 30s
